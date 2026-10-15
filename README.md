@@ -3,7 +3,7 @@
 Use two NVIDIA GPUs in **the same render** in [WanGP](https://github.com/deepbeepmeep/Wan2GP), with a manual work split
 so that GPUs of different speeds (same generation) can be paired, and without giving up WanGP's RAM offloading.
 
-> **Status: v0.3.4, experimental.** The plugin uses the second GPU for the three stages of a **MiniMax H3** render:
+> **Status: v0.3.5, experimental.** The plugin uses the second GPU for the three stages of a **MiniMax H3** render:
 > **denoising** (new in v0.3, experimental, off by default: both GPUs work on the same step, each on part of the tokens),
 > **VAE decoding** (split across `cuda:0` and `cuda:1`) and the **text encoder** (its last layers kept and run on
 > `cuda:1`). Contributions are welcome.
@@ -240,6 +240,11 @@ used, and the `[Multi-GPU]` and `[H3 Profiler]` console lines for the same rende
 
 ## Changelog
 
+- **0.3.5**: long sequences (148k tokens: 20 s, 832x1088, no sliding window) crashed at the end of a step with
+  `CUDA error: out of memory` on `cuda:1`. The key/value exchange now caps each chunk at 64 MB (fewer heads per chunk on
+  long sequences) and keeps 6 pinned slots per GPU instead of 19: at 148k tokens, pinned RAM for the exchange drops from
+  about 6.4 GB to 0.5 GB, and the full-sequence buffers on each GPU from 0.6 GB to 0.15 GB. The hidden states handed over
+  once per step use pageable RAM, and `cuda:1` gives its cached VRAM back after each step.
 - **0.3.4**: the text encoder split is off by default and skipped while denoising is split: its gain is a fraction of a
   second, and its 8 GB on `cuda:1` kept long renders (116k tokens) from splitting denoising. Closer VRAM estimate for
   denoising (measured peak about 6x the size of the rows of `cuda:1`). Real-use measurement added (Ref2VA, two phases).

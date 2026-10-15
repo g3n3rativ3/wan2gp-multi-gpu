@@ -41,7 +41,9 @@ GB = 1024 ** 3
 MIN_TOKENS = 4096          # shorter sequences (images, very short clips) stay on one GPU: little to gain
 ROW_ALIGN = 128            # split point aligned to attention/quantization tiles: same tiles as with one GPU
 CHUNK_HEADS = 4            # attention heads exchanged and attended per chunk: smaller chunks, shorter wait for the first one
+SLOT_BYTES = 64 << 20      # cap on the keys/values of one chunk: long sequences use fewer heads per chunk
 SEND_AHEAD = 3             # chunks of keys/values sent ahead of the chunk being attended
+SLOTS = SEND_AHEAD + 3     # pinned RAM slots per GPU for the exchange
 PREFETCH_BLOCKS = 2        # blocks of weights loaded on the secondary GPU ahead of the block being computed
 WAIT_POLL = 0.05
 
@@ -122,14 +124,30 @@ def _wait_event(stream, event):
         stream.wait_event(event)
 
 
-def _host_buffer(nbytes, cuda):
-    return torch.empty(nbytes, dtype=torch.uint8, pin_memory=cuda)
+def _host_slots(nbytes, count, cuda):
+    """The exchange's pinned slots, kept between passes and reallocated only when a longer sequence needs larger ones
+    (pinned RAM cannot be swapped out by Windows: the plugin keeps as little of it as possible)."""
+    pool = _state.get("slot_pool")
+    if pool is not None and pool[0] >= nbytes and pool[1] == count and pool[2] == cuda:
+        return pool[3]
+    _state["slot_pool"] = None
+    pool = None
+    if cuda:
+        empty_host_cache = getattr(torch._C, "_host_emptyCache", None)
+        if empty_host_cache is not None:
+            empty_host_cache()
+    slots = [[torch.empty(nbytes, dtype=torch.uint8, pin_memory=cuda) for _ in range(count)] for _ in range(2)]
+    _state["slot_pool"] = (nbytes, count, cuda, slots)
+    return slots
 
 
-def _to_host(tensor):
-    """Synchronous copy to (pinned) host memory."""
+def _to_host(tensor, pinned=True):
+    """Synchronous copy to host memory: pinned for small tensors read back asynchronously, pageable for the hidden
+    states handed over once per pass (hundreds of MB on long videos)."""
     if not tensor.is_cuda:
         return tensor.detach().clone()
+    if not pinned:
+        return tensor.to("cpu")
     host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
     host.copy_(tensor, non_blocking=True)
     torch.cuda.current_stream(tensor.device).synchronize()
@@ -357,7 +375,7 @@ class _Exchange:
 
     def __init__(self, session, slot_bytes, slot_count, cuda):
         self.session = session
-        self.slots = [[_host_buffer(slot_bytes, cuda) for _ in range(slot_count)] for _ in range(2)]
+        self.slots = _host_slots(slot_bytes, slot_count, cuda)
         self.next = [0, 0]
         self.pending = [set(), set()]
         self.published, self.consumed = {}, {}
@@ -432,13 +450,14 @@ class _Side:
         self.call += 1
         compute = _current_stream(self.device)
         send_stream, recv_stream = self.streams()
-        chunks = [range(start, min(start + CHUNK_HEADS, heads)) for start in range(0, heads, CHUNK_HEADS)]
+        step = session.chunk_heads
+        chunks = [range(start, min(start + step, heads)) for start in range(0, heads, step)]
         if send_stream is not None:
             send_stream.wait_stream(compute)   # k and v are written by the compute stream
         for chunk in range(min(SEND_AHEAD, len(chunks))):
             self._send(key, value, call, chunk, chunks[chunk])
 
-        width = min(CHUNK_HEADS, heads)
+        width = min(step, heads)
         flats = [(key.new_empty(total * width * head_dim), value.new_empty(total * width * head_dim)) for _ in range(2)]
         if recv_stream is not None:
             recv_stream.wait_stream(compute)   # the buffers were allocated on the compute stream
@@ -541,11 +560,11 @@ class _Session:
         attn = model.blocks[0].attn
         self.heads, self.head_dim = attn.heads, attn.head_dim
         self.blocks = len(model.blocks)
-        self._check_vram(hidden)
         element = hidden.element_size()
-        slot_bytes = max(self.rows) * min(CHUNK_HEADS, self.heads) * self.head_dim * 2 * element
-        chunks = (self.heads + CHUNK_HEADS - 1) // CHUNK_HEADS
-        self.exchange = _Exchange(self, slot_bytes, chunks + SEND_AHEAD + 2, _is_cuda(primary))
+        head_bytes = max(self.rows) * self.head_dim * 2 * element
+        self.chunk_heads = max(1, min(CHUNK_HEADS, self.heads, SLOT_BYTES // head_bytes))
+        self._check_vram(hidden)
+        self.exchange = _Exchange(self, head_bytes * self.chunk_heads, SLOTS, _is_cuda(primary))
         self.sides = (_Side(self, 0, primary), _Side(self, 1, secondary))
         self.messages, self.temb_host = {}, {}
         self.ready, self.done = {}, {}
@@ -587,7 +606,7 @@ class _Session:
         hidden_size = hidden.shape[1]
         need = (PREFETCH_BLOCKS + 2) * max(self.clones.block_bytes)
         need += 7 * self.rows[1] * hidden_size * hidden.element_size()   # measured peak: about 6x the rows of cuda:1
-        need += 4 * self.sequence * min(CHUNK_HEADS, self.heads) * self.head_dim * hidden.element_size()
+        need += 4 * self.sequence * self.chunk_heads * self.head_dim * hidden.element_size()
         need += GB // 2
         self.vram_need = need
         free = _usable_vram(secondary)
@@ -669,7 +688,7 @@ class _Session:
                         self.done[index] = done
                         self.ready.pop(index, None)
                         self.cond.notify_all()
-                return _to_host(hidden)
+                return _to_host(hidden, pinned=False)
         except _Aborted:
             return None
         except BaseException as exc:
@@ -702,7 +721,7 @@ class _Session:
         if index == 0:
             hidden = _take(x_list)
             local = hidden[:self.rows[0]].clone()
-            remote_host = _to_host(hidden[self.rows[0]:])
+            remote_host = _to_host(hidden[self.rows[0]:], pinned=False)
             del hidden
             self.loader = executor(self.devices[1].index or 0, "loader").submit(self._loader_job)
             self.worker = executor(self.devices[1].index or 0).submit(self._worker_job, remote_host)
@@ -742,6 +761,15 @@ class _Session:
                     future.result(timeout=60)
                 except Exception:
                     pass
+        secondary = self.devices[1]
+        if _is_cuda(secondary):
+            try:   # nothing may still read the pinned slots; then give the cached VRAM of the pass back
+                torch.cuda.synchronize(self.devices[0])
+                torch.cuda.synchronize(secondary)
+                with torch.cuda.device(secondary):
+                    torch.cuda.empty_cache()
+            except Exception as exc:
+                print(f"[Multi-GPU] Could not empty the VRAM cache of {secondary}: {exc}")
         if not completed or not hasattr(self, "finished"):
             return
         for device in self.devices:

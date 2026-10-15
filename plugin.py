@@ -64,7 +64,7 @@ class MultiGPUPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PLUGIN_NAME
-        self.version = "0.3.4"
+        self.version = "0.3.5"
         self.description = "Experimental multi-GPU support (v0.3: MiniMax H3 denoising, VAE decoding and text encoder on two GPUs)."
 
     def setup_ui(self):
