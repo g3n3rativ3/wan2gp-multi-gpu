@@ -53,7 +53,7 @@ _state = {
     "orig_model_forward": None,
     "orig_block_forward": None,
     "orig_qkv_attention": None,
-    "clones": {},                 # id(model) -> _Clones
+    "announced": set(),           # ids of the models whose block copies were announced in the console
     "broken": None,               # reason why the multi-GPU path was disabled after a failure
     "last_report": "No multi-GPU denoising pass yet.",
     "test_secondary": None,       # tests only: a device standing for the secondary GPU
@@ -83,10 +83,8 @@ def reset_broken():
 
 
 def release():
-    """Drop the block copies (they hold no VRAM between passes; their weights are loaded per pass)."""
-    had = bool(_state["clones"])
-    _state["clones"].clear()
-    return had
+    """Nothing is kept between denoising passes: the block copies live for one pass only."""
+    return False
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -294,11 +292,13 @@ class _Clones:
 
 
 def _clones_for(model):
-    clones = _state["clones"].get(id(model))
-    if clones is None or clones.model_ref() is not model:
-        _state["clones"].clear()
-        started = time.perf_counter()
-        clones = _state["clones"][id(model)] = _Clones(model)
+    """Block copies for one pass. They point to MMGP's pinned CPU tensors, so they are never kept after the pass: a copy
+    kept across a model switch would keep the previous model's pinned RAM from being freed, and the new model could not
+    be pinned (cudaHostRegister failed, then CUDA out of memory)."""
+    started = time.perf_counter()
+    clones = _Clones(model)
+    if id(model) not in _state["announced"]:
+        _state["announced"].add(id(model))
         print(f"[Multi-GPU] Prepared {len(clones.blocks)} H3 block copies for the secondary GPU "
               f"({max(clones.block_bytes) / GB:.2f} GB for the largest block) in {time.perf_counter() - started:.1f} s.")
     return clones
@@ -562,7 +562,8 @@ class _Session:
         self.blocks = len(model.blocks)
         element = hidden.element_size()
         head_bytes = max(self.rows) * self.head_dim * 2 * element
-        self.chunk_heads = max(1, min(CHUNK_HEADS, self.heads, SLOT_BYTES // head_bytes))
+        wanted = int(cfg.get("denoise_chunk_heads", 0) or 0) or CHUNK_HEADS
+        self.chunk_heads = max(1, min(wanted, self.heads, SLOT_BYTES // head_bytes))
         self._check_vram(hidden)
         self.exchange = _Exchange(self, head_bytes * self.chunk_heads, SLOTS, _is_cuda(primary))
         self.sides = (_Side(self, 0, primary), _Side(self, 1, secondary))
@@ -761,6 +762,7 @@ class _Session:
                     future.result(timeout=60)
                 except Exception:
                     pass
+        self.clones = None   # the copies reference the model's pinned tensors: never keep them after the pass
         secondary = self.devices[1]
         if _is_cuda(secondary):
             try:   # nothing may still read the pinned slots; then give the cached VRAM of the pass back
@@ -794,7 +796,8 @@ class _Session:
         if _is_cuda(self.devices[1]):
             peak = torch.cuda.max_memory_allocated(self.devices[1]) - getattr(self, "vram_start", 0)
             vram = f" | cuda:{secondary} peak {peak / GB:.1f} GB (estimate {self.vram_need / GB:.1f} GB)"
-        report = (f"Last H3 denoising pass: {wall:.1f} s for {self.sequence} tokens, {self.rows[0]} on cuda:{primary} "
+        report = (f"Last H3 denoising pass: {wall:.1f} s for {self.sequence} tokens (chunks of {self.chunk_heads} "
+                  f"head{'s' if self.chunk_heads > 1 else ''}), {self.rows[0]} on cuda:{primary} "
                   f"({share:.0f} %), {self.rows[1]} on cuda:{secondary} | waits for the other GPU: cuda:{primary} "
                   f"{stall0:.2f} s, cuda:{secondary} {stall1:.2f} s ({hint}) | cuda:{secondary} waited {weights:.2f} s "
                   f"for weights{vram}.")

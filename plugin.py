@@ -64,7 +64,7 @@ class MultiGPUPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PLUGIN_NAME
-        self.version = "0.3.5"
+        self.version = "0.3.8"
         self.description = "Experimental multi-GPU support (v0.3: MiniMax H3 denoising, VAE decoding and text encoder on two GPUs)."
 
     def setup_ui(self):
@@ -94,6 +94,10 @@ class MultiGPUPlugin(WAN2GPPlugin):
                                           info="Share of the video tokens denoised on cuda:0. Same rule as below; the console "
                                                "line of each denoising pass says which GPU waits for the other.")
                 denoise_text = gr.Markdown(_split_summary(cfg["denoise_share_cuda0"]))
+                chunk_heads = gr.Dropdown(choices=[("Automatic (4, fewer on long videos)", 0), ("1", 1), ("2", 2), ("4", 4), ("8", 8)],
+                                          value=cfg["denoise_chunk_heads"], label="Attention heads per exchanged chunk",
+                                          info="Smaller chunks shorten the waits between the GPUs, larger ones mean fewer, "
+                                               "bigger attention calls. Long videos are capped at 64 MB per chunk.")
             with gr.Group():
                 gr.Markdown("**VAE decoding** (the final step that turns latents into video frames)")
                 vae_enabled = gr.Checkbox(label="Split H3 VAE decoding across cuda:0 and cuda:1", value=cfg["vae_enabled"])
@@ -132,6 +136,10 @@ class MultiGPUPlugin(WAN2GPPlugin):
             cfg_now = settings.update(denoise_share_cuda0=int(value))
             return _split_summary(cfg_now["denoise_share_cuda0"])
 
+        def on_chunk_heads(value):
+            cfg_now = settings.update(denoise_chunk_heads=int(value))
+            return _status(cfg_now)
+
         def on_vae_enabled(value):
             cfg_now = settings.update(vae_enabled=bool(value))
             if not cfg_now["vae_enabled"]:
@@ -161,6 +169,7 @@ class MultiGPUPlugin(WAN2GPPlugin):
         enabled.change(fn=on_enabled, inputs=[enabled], outputs=[status], show_progress="hidden")
         denoise_enabled.change(fn=on_denoise_enabled, inputs=[denoise_enabled], outputs=[status], show_progress="hidden")
         denoise_share.release(fn=on_denoise_share, inputs=[denoise_share], outputs=[denoise_text], show_progress="hidden")
+        chunk_heads.change(fn=on_chunk_heads, inputs=[chunk_heads], outputs=[status], show_progress="hidden")
         vae_enabled.change(fn=on_vae_enabled, inputs=[vae_enabled], outputs=[status], show_progress="hidden")
         share.release(fn=on_share, inputs=[share], outputs=[split_text], show_progress="hidden")
         te_enabled.change(fn=on_te_enabled, inputs=[te_enabled], outputs=[status], show_progress="hidden")

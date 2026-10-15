@@ -5,14 +5,16 @@ import threading
 
 _PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 _DEFAULTS = {
-    "enabled": False,          # master switch
+    "enabled": False,          # master switch: never restored at startup, so the split is always turned on by hand
     "vae_enabled": True,       # H3 VAE decoding split
     "share_cuda0": 50,         # % of the VAE tiles decoded on cuda:0
     "te_enabled": False,       # H3 text encoder: last layers kept on the secondary GPU (skipped while denoising is split)
     "te_layers_cuda1": 20,     # number of text encoder layers (out of 50) kept on the secondary GPU
     "denoise_enabled": False,  # H3 denoising split (experimental)
     "denoise_share_cuda0": 50, # % of the token rows denoised on cuda:0
+    "denoise_chunk_heads": 0,  # attention heads per exchanged chunk: 0 = automatic (4, fewer on long sequences)
 }
+_NOT_RESTORED = {"enabled"}  # saved for reference, but every WanGP start begins with multi-GPU off
 _lock = threading.Lock()
 _values = dict(_DEFAULTS)
 
@@ -22,6 +24,8 @@ def _load():
         with open(_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         for key, default in _DEFAULTS.items():
+            if key in _NOT_RESTORED:
+                continue
             if key in data and isinstance(data[key], type(default)):
                 _values[key] = data[key]
     except FileNotFoundError:

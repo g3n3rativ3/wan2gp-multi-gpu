@@ -3,7 +3,7 @@
 Use two NVIDIA GPUs in **the same render** in [WanGP](https://github.com/deepbeepmeep/Wan2GP), with a manual work split
 so that GPUs of different speeds (same generation) can be paired, and without giving up WanGP's RAM offloading.
 
-> **Status: v0.3.5, experimental.** The plugin uses the second GPU for the three stages of a **MiniMax H3** render:
+> **Status: v0.3.8, experimental.** The plugin uses the second GPU for the three stages of a **MiniMax H3** render:
 > **denoising** (new in v0.3, experimental, off by default: both GPUs work on the same step, each on part of the tokens),
 > **VAE decoding** (split across `cuda:0` and `cuda:1`) and the **text encoder** (its last layers kept and run on
 > `cuda:1`). Contributions are welcome.
@@ -40,6 +40,9 @@ chunk while the previous chunk is being attended, so that every token still atte
   "2 Phases Plus" plugin): phase 1 (37703 tokens) 20.4 -> 13.2 s per step (-35 %), phase 2 (116634 tokens) 97.2 -> 61.8 s
   per step (-36 %), VAE decoding 50.4 -> 40.1 s, **whole render 345 s -> 235 s (-32 %)**. Peak VRAM on `cuda:1`: 2.5 GB
   and 5.2 GB.
+- Long sequence (v0.3.5, same setup, 20 s without sliding window, 481 frames): phase 1 (45836 tokens) 16.4 s per step,
+  phase 2 (147972 tokens) 81.9 s per step with 5.6 GB peak on `cuda:1`; smaller exchange chunks cut the waits of
+  phase 2 from 3.7 / 6.5 s to 0.7 / 1.4 s per step (87.1 -> 81.9 s).
 - Safety net: if anything fails on the multi-GPU path (not enough VRAM, an unsupported option, an error on `cuda:1`),
   the denoising pass is computed again on one GPU, the render goes on, and the feature stays off until you switch it off
   and on again. The tab shows the reason.
@@ -105,11 +108,14 @@ result comes back to `cuda:0`.
 
 In the Media Generator, switch to Advanced Mode and open the **Multi-GPU** tab (after **Misc.**):
 
-- **Enable multi-GPU**: master on/off switch. Off means WanGP behaves exactly as without the plugin.
+- **Enable multi-GPU**: master on/off switch. Off means WanGP behaves exactly as without the plugin. It is always off
+  when WanGP starts, so the second GPU is never used by accident; the other settings of the tab are remembered.
 - **Denoising** (experimental)
   - **Split H3 denoising across cuda:0 and cuda:1**: off by default.
   - **Denoising work share of cuda:0 (%)**: share of the tokens denoised on `cuda:0`. Default 50; about 56 for an
     RTX 5080 (`cuda:0`) with an RTX 5070 Ti (`cuda:1`).
+  - **Attention heads per exchanged chunk**: automatic by default (4, fewer on long videos so that a chunk stays under
+    64 MB). Smaller chunks shorten the waits between the GPUs; larger ones mean fewer, bigger attention calls.
 - **VAE decoding**
   - **Split H3 VAE decoding across cuda:0 and cuda:1**: on by default (once the master switch is on).
   - **Work share of cuda:0 (%)**: share of the tiles decoded on `cuda:0`; `cuda:1` gets the rest. Default 50.
@@ -240,6 +246,16 @@ used, and the `[Multi-GPU]` and `[H3 Profiler]` console lines for the same rende
 
 ## Changelog
 
+- **0.3.8**: **Enable multi-GPU** is always off when WanGP starts (the other settings are still remembered). The model
+  switch failure of 0.3.7 turned out to come from another plugin that kept the previous H3 pipeline alive; WanGP's
+  `--ram-debug` report shows which object holds a released model, if it happens again. Real-use measurement with 1 head
+  per chunk: Ref2VA 15 s, two phases, 244 to 247 s (about 240 s with the automatic setting, 345 to 349 s on one GPU).
+- **0.3.7**: switching to another H3 model in the same WanGP session failed while loading it ("Reserved RAM is short",
+  `cudaHostRegister failed`, then `CUDA error: out of memory`): the block copies kept between passes still pointed to the
+  previous model's pinned RAM, so it could not be freed. The copies now live for one pass only (they take no time to
+  build). Chunk size test at 720p: 1, 2 and 4 heads per chunk all give 11.9 to 12.0 s per step; the automatic setting stays.
+- **0.3.6**: **Attention heads per exchanged chunk** setting (automatic, 1, 2, 4 or 8), to compare chunk sizes; the
+  console line of each denoising pass shows the size used.
 - **0.3.5**: long sequences (148k tokens: 20 s, 832x1088, no sliding window) crashed at the end of a step with
   `CUDA error: out of memory` on `cuda:1`. The key/value exchange now caps each chunk at 64 MB (fewer heads per chunk on
   long sequences) and keeps 6 pinned slots per GPU instead of 19: at 148k tokens, pinned RAM for the exchange drops from
