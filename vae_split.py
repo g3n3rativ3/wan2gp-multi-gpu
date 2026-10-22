@@ -18,8 +18,8 @@ import traceback
 
 import torch
 
-from . import settings
-from .common import executor as _executor, gpu_name, match_float_dtypes, other_gpu, to_pinned_host as _to_pinned_host
+from . import settings, kernel_compat
+from .common import clear_stale_cuda_error, executor as _executor, gpu_name, match_float_dtypes, other_gpu, to_pinned_host as _to_pinned_host
 from .common import warn_once as _warn_once
 
 _lock = threading.Lock()
@@ -30,7 +30,7 @@ _state = {
     "replica": None,            # decoder copy on the secondary GPU
     "replica_key": None,
     "decode": None,             # statistics of the VAE decode in progress
-    "last_report": "No multi-GPU VAE decode yet.",
+    "last_report": "No multi-GPU H3 VAE decode yet.",
 }
 
 
@@ -92,6 +92,7 @@ def split_count(batch, primary_index, share_cuda0):
 
 
 def _run_secondary(replica, host_input, tokens, device_index):
+    clear_stale_cuda_error(device_index)
     with torch.no_grad():
         hidden_states = host_input.to(torch.device("cuda", device_index), non_blocking=True)
         out = _state["orig_forward"](replica, hidden_states, tokens)
@@ -110,7 +111,7 @@ def _patched_forward(self, hidden_states, tokens=False):
     primary_index = primary.index if primary.index is not None else torch.cuda.current_device()
     secondary_index = other_gpu(primary_index)
     keep = split_count(batch, primary_index, cfg["share_cuda0"])
-    if keep >= batch:
+    if keep >= batch or kernel_compat.prepare_secondary(primary_index, secondary_index) is not None:
         return orig(self, hidden_states, tokens)
     try:
         replica = _replica_for(self, secondary_index)

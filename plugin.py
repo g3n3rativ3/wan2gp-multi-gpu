@@ -1,8 +1,10 @@
 """Multi-GPU plugin for WanGP.
 
-v0.3: MiniMax H3 denoising split across cuda:0 and cuda:1 by token rows (denoise_split.py, experimental), VAE decoding
-split by tiles (vae_split.py), and the last layers of the text encoder kept on cuda:1 (te_split.py). See README.md.
-The settings live in a "Multi-GPU" tab added after the "Misc." tab of the Media Generator advanced settings.
+MiniMax H3: denoising split across cuda:0 and cuda:1 by token rows (denoise_split.py), VAE decoding split by tiles
+(vae_split.py), and the last layers of the text encoder kept on cuda:1 (te_split.py).
+LTX-2 (since v0.5): denoising split by video rows (ltx2_denoise.py) and VAE decoding split by spatial tiles
+(ltx2_vae.py), ported from the "Multi-GPU LTX-2" plugin for WanGP 11.22.
+See README.md. The settings live in a "Multi-GPU" tab added after the "Misc." tab of the Media Generator advanced settings.
 """
 import traceback
 
@@ -11,6 +13,12 @@ import gradio as gr
 from shared.utils.plugins import WAN2GPPlugin
 
 from . import denoise_split, settings, te_split, vae_split
+
+try:   # LTX-2 support: optional, a WanGP without LTX-2 (or with another version of it) still gets the H3 features
+    from . import ltx2_denoise, ltx2_vae
+except Exception as _ltx_import_error:   # noqa: N816
+    ltx2_denoise = ltx2_vae = None
+    print(f"[Multi-GPU] LTX-2 support unavailable: {_ltx_import_error}")
 from .common import gpu_list
 
 PLUGIN_NAME = "Multi-GPU"
@@ -46,47 +54,70 @@ def _status(cfg=None):
     if not cfg["enabled"]:
         state = "**Disabled**: WanGP uses one GPU, as usual."
     else:
-        parts = [name for name, on in (("H3 denoising", cfg["denoise_enabled"]),
+        parts = [name for name, on in (("H3 denoising" + (" (videos and images)" if cfg["denoise_images"] else " (videos)"),
+                                        cfg["denoise_enabled"]),
                                        ("H3 VAE decoding", cfg["vae_enabled"]),
                                        ("H3 text encoder", cfg["te_enabled"] and cfg["te_layers_cuda1"] > 0)) if on]
+        parts += [name for name, on in (("LTX-2 denoising", cfg["ltx_denoise_enabled"]),
+                                        ("LTX-2 VAE decoding", cfg["ltx_vae_enabled"])) if on and ltx2_denoise is not None]
         state = f"**Enabled** for: {', '.join(parts)}." if parts else "**Enabled**, but no feature is selected."
-    return (f"{state}\n\n- {te_split.last_report()}\n- {denoise_split.last_report()}\n- {vae_split.last_report()}")
+    lines = [te_split.last_report(), denoise_split.last_report(), vae_split.last_report()]
+    if ltx2_denoise is not None:
+        lines += [ltx2_denoise.last_report(), ltx2_vae.last_report()]
+    return state + "\n\n" + "\n".join(f"- {line}" for line in lines)
 
 
 def _release_all():
-    freed_te = te_split.release()
-    freed_vae = vae_split.release()
-    freed_denoise = denoise_split.release()
-    return freed_te or freed_vae or freed_denoise
+    freed = [te_split.release(), vae_split.release(), denoise_split.release()]
+    if ltx2_denoise is not None:
+        freed += [ltx2_vae.release(), ltx2_denoise.release()]
+    return any(freed)
 
 
 class MultiGPUPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PLUGIN_NAME
-        self.version = "0.3.8"
-        self.description = "Experimental multi-GPU support (v0.3: MiniMax H3 denoising, VAE decoding and text encoder on two GPUs)."
+        self.version = "0.5.3"
+        self.description = ("Experimental multi-GPU support: MiniMax H3 (denoising, VAE decoding, text encoder) and LTX-2 "
+                            "(denoising, VAE decoding) on two GPUs.")
 
     def setup_ui(self):
-        for name, module in (("H3 VAE decoding", vae_split), ("H3 text encoder", te_split), ("H3 denoising", denoise_split)):
+        modules = [("H3 VAE decoding", vae_split), ("H3 text encoder", te_split), ("H3 denoising", denoise_split)]
+        if ltx2_denoise is not None:   # after the H3 denoising: both wrap attention_kit.qkv_attention (see ltx2_denoise.install)
+            modules += [("LTX-2 denoising", ltx2_denoise), ("LTX-2 VAE decoding", ltx2_vae)]
+        for name, module in modules:
             try:
                 module.install()
                 print(f"[Multi-GPU] Installed: {name} can use cuda:0 and cuda:1 (Media Generator > Multi-GPU tab).")
             except Exception as exc:
                 print(f"[Multi-GPU] Could not install the {name} hooks: {exc}")
                 traceback.print_exc()
+        try:
+            from . import kernel_compat
+            if kernel_compat.install_wangp_fixes():
+                print("[Multi-GPU] Installed a fix for WanGP's shared INT8 projections with WGPKernels on non-ConvRot "
+                      "checkpoints (see README, Known issues of WanGP).")
+        except Exception as exc:
+            print(f"[Multi-GPU] Could not install the WanGP INT8 fix: {exc}")
         self.insert_after("misc_tab", self._build_tab)
 
     def _build_tab(self):
         cfg = settings.get()
         with gr.Tab(PLUGIN_NAME) as tab:
-            gr.Markdown("Experimental. **v0.3 uses the second GPU for MiniMax H3 denoising (experimental), VAE decoding "
-                        "and text encoding.** Settings apply to the next denoising step, prompt or decode, and are saved "
-                        "automatically.")
+            gr.Markdown("Experimental. **Uses the second GPU for MiniMax H3 (denoising, VAE decoding, text encoding) and "
+                        "LTX-2 (denoising, VAE decoding).** Settings apply to the next denoising step, prompt or decode, "
+                        "and are saved automatically.")
             gr.Markdown(_gpu_summary())
-            enabled = gr.Checkbox(label="Enable multi-GPU", value=cfg["enabled"])
+            enabled = gr.Checkbox(label="Enable multi-GPU", value=cfg["enabled"],
+                                  info="Master switch, off at every WanGP start. Each feature below also needs it.")
+            chunk_heads = gr.Dropdown(choices=[("Automatic (4, fewer on long videos)", 0), ("1", 1), ("2", 2), ("4", 4), ("8", 8)],
+                                      value=cfg["denoise_chunk_heads"], label="Attention heads per exchanged chunk (H3 and LTX-2)",
+                                      info="Smaller chunks shorten the waits between the GPUs, larger ones mean fewer, "
+                                           "bigger attention calls. Long videos are capped at 64 MB per chunk.")
+            gr.Markdown("### MiniMax H3")
             with gr.Group():
-                gr.Markdown("**Denoising** (the main part of a render) - experimental")
+                gr.Markdown("**Denoising** (the main part of a render)")
                 denoise_enabled = gr.Checkbox(label="Split H3 denoising across cuda:0 and cuda:1",
                                               value=cfg["denoise_enabled"])
                 denoise_share = gr.Slider(minimum=10, maximum=90, step=1, value=cfg["denoise_share_cuda0"],
@@ -94,10 +125,10 @@ class MultiGPUPlugin(WAN2GPPlugin):
                                           info="Share of the video tokens denoised on cuda:0. Same rule as below; the console "
                                                "line of each denoising pass says which GPU waits for the other.")
                 denoise_text = gr.Markdown(_split_summary(cfg["denoise_share_cuda0"]))
-                chunk_heads = gr.Dropdown(choices=[("Automatic (4, fewer on long videos)", 0), ("1", 1), ("2", 2), ("4", 4), ("8", 8)],
-                                          value=cfg["denoise_chunk_heads"], label="Attention heads per exchanged chunk",
-                                          info="Smaller chunks shorten the waits between the GPUs, larger ones mean fewer, "
-                                               "bigger attention calls. Long videos are capped at 64 MB per chunk.")
+                denoise_images = gr.Checkbox(label="Also split still images (Text to Image)", value=cfg["denoise_images"],
+                                             info="May be slower than one GPU: an image has too few tokens to make up for "
+                                                  "the exchanges between the GPUs (2048x2048: 2.4 s per step on two GPUs, "
+                                                  "2.1 s on one). Needs Enable multi-GPU and the denoising split.")
             with gr.Group():
                 gr.Markdown("**VAE decoding** (the final step that turns latents into video frames)")
                 vae_enabled = gr.Checkbox(label="Split H3 VAE decoding across cuda:0 and cuda:1", value=cfg["vae_enabled"])
@@ -115,6 +146,23 @@ class MultiGPUPlugin(WAN2GPPlugin):
                                            "RAM. More layers: faster prompts, less free VRAM on cuda:1. If they do not fit "
                                            "(5 GB are kept free for the VAE copy), fewer are used.")
                 te_text = gr.Markdown(_te_summary(cfg["te_layers_cuda1"]))
+            ltx = ltx2_denoise is not None
+            gr.Markdown("### LTX-2" + ("" if ltx else " (unavailable with this WanGP version: see the console)"))
+            with gr.Group(visible=ltx):
+                ltx_denoise_enabled = gr.Checkbox(label="Split LTX-2 denoising across cuda:0 and cuda:1",
+                                                  value=cfg["ltx_denoise_enabled"])
+                ltx_denoise_share = gr.Slider(minimum=10, maximum=90, step=1, value=cfg["ltx_denoise_share_cuda0"],
+                                              label="LTX-2 denoising work share of cuda:0 (%)",
+                                              info="Share of the video tokens denoised on cuda:0 (the audio tokens are "
+                                                   "computed by both GPUs). The console line of each pass suggests a share.")
+                ltx_denoise_text = gr.Markdown(_split_summary(cfg["ltx_denoise_share_cuda0"]))
+                ltx_vae_enabled = gr.Checkbox(label="Split LTX-2 VAE decoding across cuda:0 and cuda:1",
+                                              value=cfg["ltx_vae_enabled"],
+                                              info="Shares the spatial tiles of the decoder. A frame decoded as a single "
+                                                   "tile (often with the default VAE tiling) stays on cuda:0.")
+                ltx_vae_share = gr.Slider(minimum=0, maximum=100, step=1, value=cfg["ltx_vae_share_cuda0"],
+                                          label="LTX-2 VAE work share of cuda:0 (%)")
+                ltx_vae_text = gr.Markdown(_split_summary(cfg["ltx_vae_share_cuda0"]))
             status = gr.Markdown(_status(cfg))
             with gr.Row():
                 refresh_btn = gr.Button("Refresh status", size="sm")
@@ -122,6 +170,8 @@ class MultiGPUPlugin(WAN2GPPlugin):
 
         def on_enabled(value):
             denoise_split.reset_broken()
+            if ltx2_denoise is not None:
+                ltx2_denoise.reset_broken()
             cfg_now = settings.update(enabled=bool(value))
             if not cfg_now["enabled"]:
                 _release_all()
@@ -130,6 +180,10 @@ class MultiGPUPlugin(WAN2GPPlugin):
         def on_denoise_enabled(value):
             denoise_split.reset_broken()
             cfg_now = settings.update(denoise_enabled=bool(value))
+            return _status(cfg_now)
+
+        def on_denoise_images(value):
+            cfg_now = settings.update(denoise_images=bool(value))
             return _status(cfg_now)
 
         def on_denoise_share(value):
@@ -162,18 +216,47 @@ class MultiGPUPlugin(WAN2GPPlugin):
                 te_split.release()
             return _te_summary(cfg_now["te_layers_cuda1"]), _status(cfg_now)
 
+        def on_ltx_denoise_enabled(value):
+            ltx2_denoise.reset_broken()
+            cfg_now = settings.update(ltx_denoise_enabled=bool(value))
+            if not cfg_now["ltx_denoise_enabled"]:
+                ltx2_denoise.release()
+            return _status(cfg_now)
+
+        def on_ltx_denoise_share(value):
+            cfg_now = settings.update(ltx_denoise_share_cuda0=int(value))
+            return _split_summary(cfg_now["ltx_denoise_share_cuda0"])
+
+        def on_ltx_vae_enabled(value):
+            cfg_now = settings.update(ltx_vae_enabled=bool(value))
+            if not cfg_now["ltx_vae_enabled"]:
+                ltx2_vae.release()
+            return _status(cfg_now)
+
+        def on_ltx_vae_share(value):
+            cfg_now = settings.update(ltx_vae_share_cuda0=int(value))
+            return _split_summary(cfg_now["ltx_vae_share_cuda0"])
+
         def on_free():
             message = "Secondary GPU memory freed." if _release_all() else "Nothing to free."
             return f"{message}\n\n{_status()}"
 
         enabled.change(fn=on_enabled, inputs=[enabled], outputs=[status], show_progress="hidden")
         denoise_enabled.change(fn=on_denoise_enabled, inputs=[denoise_enabled], outputs=[status], show_progress="hidden")
+        denoise_images.change(fn=on_denoise_images, inputs=[denoise_images], outputs=[status], show_progress="hidden")
         denoise_share.release(fn=on_denoise_share, inputs=[denoise_share], outputs=[denoise_text], show_progress="hidden")
         chunk_heads.change(fn=on_chunk_heads, inputs=[chunk_heads], outputs=[status], show_progress="hidden")
         vae_enabled.change(fn=on_vae_enabled, inputs=[vae_enabled], outputs=[status], show_progress="hidden")
         share.release(fn=on_share, inputs=[share], outputs=[split_text], show_progress="hidden")
         te_enabled.change(fn=on_te_enabled, inputs=[te_enabled], outputs=[status], show_progress="hidden")
         te_layers.release(fn=on_te_layers, inputs=[te_layers], outputs=[te_text, status], show_progress="hidden")
+        if ltx:
+            ltx_denoise_enabled.change(fn=on_ltx_denoise_enabled, inputs=[ltx_denoise_enabled], outputs=[status],
+                                       show_progress="hidden")
+            ltx_denoise_share.release(fn=on_ltx_denoise_share, inputs=[ltx_denoise_share], outputs=[ltx_denoise_text],
+                                      show_progress="hidden")
+            ltx_vae_enabled.change(fn=on_ltx_vae_enabled, inputs=[ltx_vae_enabled], outputs=[status], show_progress="hidden")
+            ltx_vae_share.release(fn=on_ltx_vae_share, inputs=[ltx_vae_share], outputs=[ltx_vae_text], show_progress="hidden")
         refresh_btn.click(fn=lambda: _status(), inputs=None, outputs=[status], show_progress="hidden")
         free_btn.click(fn=on_free, inputs=None, outputs=[status], show_progress="hidden")
         return tab

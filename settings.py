@@ -12,7 +12,12 @@ _DEFAULTS = {
     "te_layers_cuda1": 20,     # number of text encoder layers (out of 50) kept on the secondary GPU
     "denoise_enabled": False,  # H3 denoising split (experimental)
     "denoise_share_cuda0": 50, # % of the token rows denoised on cuda:0
-    "denoise_chunk_heads": 0,  # attention heads per exchanged chunk: 0 = automatic (4, fewer on long sequences)
+    "denoise_chunk_heads": 0,
+    "denoise_images": False,   # also split the denoising of still images (Text to Image): usually slower than one GPU
+    "ltx_denoise_enabled": True,     # LTX-2 denoising split (needs the master switch)
+    "ltx_denoise_share_cuda0": 50,   # % of the LTX-2 video tokens denoised on cuda:0
+    "ltx_vae_enabled": True,         # LTX-2 VAE decoding split (spatial tiles)
+    "ltx_vae_share_cuda0": 50,       # % of the LTX-2 VAE tiles decoded on cuda:0  # attention heads per exchanged chunk: 0 = automatic (4, fewer on long sequences)
 }
 _NOT_RESTORED = {"enabled"}  # saved for reference, but every WanGP start begins with multi-GPU off
 _lock = threading.Lock()

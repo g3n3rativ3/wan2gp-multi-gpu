@@ -1,8 +1,8 @@
 {
   "name": "Multi-GPU",
   "author": "Baptistus",
-  "version": "0.3.8",
-  "description": "Experimental multi-GPU support for WanGP. v0.3 uses a second GPU for MiniMax H3 denoising (sequence parallelism, adjustable work split, experimental), VAE decoding and the text encoder. Adds a 'Multi-GPU' tab to the Media Generator advanced settings.",
-  "date": "2026-10-15",
+  "version": "0.5.3",
+  "description": "Experimental multi-GPU support for WanGP v18.17+: a second GPU shares MiniMax H3 renders (denoising by sequence parallelism, VAE decoding, text encoder) and LTX-2 renders (2.3 and 2.5: denoising, VAE decoding), with adjustable work shares. Adds a 'Multi-GPU' tab to the Media Generator advanced settings.",
+  "date": "2026-10-22",
   "wan2gp_version": ""
 }

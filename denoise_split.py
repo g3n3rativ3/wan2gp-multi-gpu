@@ -19,8 +19,9 @@ register pinned memory as "portable" (visible to every GPU), which changes nothi
 
 Limits (version 0.3)
 --------------------
-Standard H3 attention path only. A denoising pass falls back to one GPU when it uses Sol (sparse) attention, VEDA, VDN,
-ControlNet, Spectrum or first block caching, CUDA graphs, or a sequence shorter than MIN_TOKENS. Any failure of the
+Standard H3 attention path only (ControlNet-Union included since 0.4.3: its control blocks are split like the main
+blocks). A denoising pass falls back to one GPU when it uses Sol (sparse) attention, VEDA, VDN, Spectrum or first block
+caching, CUDA graphs, or a sequence shorter than MIN_TOKENS. Any failure of the
 multi-GPU path reruns the pass on one GPU and disables the feature until it is switched off and on again.
 """
 import contextlib
@@ -34,11 +35,11 @@ import weakref
 import torch
 import torch.nn as nn
 
-from . import settings
-from .common import executor, tensor_bytes, warn_once
+from . import settings, kernel_compat
+from .common import clear_stale_cuda_error, cuda_graphs_on, executor, tensor_bytes, warn_once
 
 GB = 1024 ** 3
-MIN_TOKENS = 4096          # shorter sequences (images, very short clips) stay on one GPU: little to gain
+MIN_TOKENS = 2048          # shorter sequences (small images) stay on one GPU: too little work to share
 ROW_ALIGN = 128            # split point aligned to attention/quantization tiles: same tiles as with one GPU
 CHUNK_HEADS = 4            # attention heads exchanged and attended per chunk: smaller chunks, shorter wait for the first one
 SLOT_BYTES = 64 << 20      # cap on the keys/values of one chunk: long sequences use fewer heads per chunk
@@ -53,9 +54,10 @@ _state = {
     "orig_model_forward": None,
     "orig_block_forward": None,
     "orig_qkv_attention": None,
+    "orig_add_control_skip": None,
     "announced": set(),           # ids of the models whose block copies were announced in the console
     "broken": None,               # reason why the multi-GPU path was disabled after a failure
-    "last_report": "No multi-GPU denoising pass yet.",
+    "last_report": "No multi-GPU H3 denoising pass yet.",
     "test_secondary": None,       # tests only: a device standing for the secondary GPU
 }
 
@@ -134,7 +136,7 @@ def _host_slots(nbytes, count, cuda):
         empty_host_cache = getattr(torch._C, "_host_emptyCache", None)
         if empty_host_cache is not None:
             empty_host_cache()
-    slots = [[torch.empty(nbytes, dtype=torch.uint8, pin_memory=cuda) for _ in range(count)] for _ in range(2)]
+    slots = [[torch.empty(nbytes, dtype=torch.uint8, device="cpu", pin_memory=cuda) for _ in range(count)] for _ in range(2)]
     _state["slot_pool"] = (nbytes, count, cuda, slots)
     return slots
 
@@ -146,7 +148,7 @@ def _to_host(tensor, pinned=True):
         return tensor.detach().clone()
     if not pinned:
         return tensor.to("cpu")
-    host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+    host = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
     host.copy_(tensor, non_blocking=True)
     torch.cuda.current_stream(tensor.device).synchronize()
     return host
@@ -230,7 +232,37 @@ def _clone_module(module, memo, shared):
             pass
         else:
             clone.__dict__["forward"] = _rebind(inner, module, clone)
+            # A forward replaced by another plugin may compute inputs on the primary GPU (for example from tensors it
+            # keeps): the layers it calls take them on the device of their own weights.
+            for child in clone._modules.values():
+                if child is not None and "weight" in child._parameters:
+                    _follow_weight_device(child)
     return clone
+
+
+def _follow_weight_device(module):
+    """The module takes its input on the device of its weights. An input left on the other GPU goes through RAM (no
+    direct GPU-to-GPU copy: GeForce cards have no peer access, and WanGP's VMM memory cannot be read by another GPU).
+    Such inputs are small tensors kept by another plugin for a whole pass (the FL2VA control timestep embedding of the
+    Ref2VA ControlNet plugin), so the last one moved is kept: one transfer per pass."""
+    inner = module.__dict__.get("forward")
+    if inner is None:
+        inner = types.MethodType(type(module).forward, module)
+    moved = {}
+
+    def forward(x, *args, **kwargs):
+        weight = module._parameters.get("weight")
+        if torch.is_tensor(x) and weight is not None and x.device != weight.device:
+            key = (id(x), x.data_ptr(), tuple(x.shape), x.dtype, x.device, weight.device)   # (no version counter in inference mode)
+            if moved.get("key") != key:
+                if x.is_cuda:
+                    torch.cuda.synchronize(x.device)   # x may come from any stream of its GPU
+                host = x.detach().to("cpu")
+                moved.clear()
+                moved.update(key=key, source=x, value=host.to(weight.device, non_blocking=False))
+            x = moved["value"]
+        return inner(x, *args, **kwargs)
+    module.__dict__["forward"] = forward
 
 
 class _Clones:
@@ -528,6 +560,16 @@ def _rows_slice(value, start, stop, sequence):
     return _map(value, cut)
 
 
+def _rebase_ranges(ranges, start, stop):
+    """Row ranges [first, last) of the full sequence, restricted to [start, stop) and re-based on start."""
+    out = []
+    for first, last in ranges:
+        first, last = max(first, start), min(last, stop)
+        if last > first:
+            out.append((first - start, last - start))
+    return out
+
+
 def _rebase_segments(segments, start, stop):
     out = []
     for first, last, row in segments:
@@ -560,6 +602,9 @@ class _Session:
         attn = model.blocks[0].attn
         self.heads, self.head_dim = attn.heads, attn.head_dim
         self.blocks = len(model.blocks)
+        # ControlNet-Union: the control blocks run on the same rows split as the main blocks, before them
+        self.control_layers = tuple(ctx.control_layers) if ctx.control_active else ()
+        self.control_set = set(self.control_layers)
         element = hidden.element_size()
         head_bytes = max(self.rows) * self.head_dim * 2 * element
         wanted = int(cfg.get("denoise_chunk_heads", 0) or 0) or CHUNK_HEADS
@@ -568,6 +613,7 @@ class _Session:
         self.exchange = _Exchange(self, head_bytes * self.chunk_heads, SLOTS, _is_cuda(primary))
         self.sides = (_Side(self, 0, primary), _Side(self, 1, secondary))
         self.messages, self.temb_host = {}, {}
+        self.control_messages, self.inputs, self.skip = {}, {}, None
         self.ready, self.done = {}, {}
         self.worker = self.loader = None
 
@@ -607,6 +653,8 @@ class _Session:
         hidden_size = hidden.shape[1]
         need = (PREFETCH_BLOCKS + 2) * max(self.clones.block_bytes)
         need += 7 * self.rows[1] * hidden_size * hidden.element_size()   # measured peak: about 6x the rows of cuda:1
+        if self.control_layers:   # the control stream of cuda:1 and the control block's activations
+            need += 3 * self.rows[1] * hidden_size * hidden.element_size()
         need += 4 * self.sequence * self.chunk_heads * self.head_dim * hidden.element_size()
         need += GB // 2
         self.vram_need = need
@@ -627,6 +675,8 @@ class _Session:
 
     def _loader_job(self):
         device = self.devices[1]
+        if _is_cuda(device):
+            clear_stale_cuda_error(device.index or 0)
         stream = _new_stream(device)
         loaded = []
         try:
@@ -662,28 +712,56 @@ class _Session:
                 for old in loaded:
                     _unload_block(self.clones, old)
 
-    def _worker_job(self, hidden_host):
+    def _worker_job(self):
         device = self.devices[1]
+        if _is_cuda(device):
+            clear_stale_cuda_error(device.index or 0)
         side = self.sides[1]
         original = _state["orig_block_forward"]
+        add_skip = _state["orig_add_control_skip"]
         _tls.sp = side
         try:
             with self._grad_mode():
                 compute = _current_stream(device)
-                hidden = hidden_host.to(device, non_blocking=True)
                 rope = None if self.rope_remote_host is None else _map(self.rope_remote_host, lambda t: t.to(device, non_blocking=True))
-                tembs = {}
-                for index in range(self.blocks):
-                    key = self.wait_for(lambda: index in self.messages, lambda: self.messages[index])
+                tembs, hidden, stream = {}, None, None
+
+                def temb_for(key):
                     if key not in tembs:
                         tembs[key] = self.temb_host[key].to(device, non_blocking=True)
+                    return tembs[key]
+
+                def wait_weights(index):
                     event, _ = self.wait_for(lambda: index in self.ready, lambda: self.ready[index])
                     before = _record(_event(device, timing=True), compute)
                     _wait_event(compute, event)
                     after = _record(_event(device, timing=True), compute)
                     if before is not None:
                         side.weight_stalls.append((before, after))
-                    hidden = original(self.clones.blocks[index], [hidden], tembs[key], self.segments[1], rope)
+
+                for index in range(self.blocks):
+                    clone = self.clones.blocks[index]
+                    control = index in self.control_set
+                    if control:
+                        key = self.wait_for(lambda: index in self.control_messages, lambda: self.control_messages[index])
+                        if index == self.control_layers[0]:
+                            stream = self.wait_for(lambda: "control" in self.inputs, lambda: self.inputs.pop("control"))
+                            stream = stream.to(device, non_blocking=True)
+                        wait_weights(index)
+                        stream = original(clone.control, [stream], temb_for(key), self.segments[1], rope)
+                    key = self.wait_for(lambda: index in self.messages, lambda: self.messages[index])
+                    if index == 0:
+                        hidden = self.wait_for(lambda: "hidden" in self.inputs, lambda: self.inputs.pop("hidden"))
+                        hidden = hidden.to(device, non_blocking=True)
+                    if not control:
+                        wait_weights(index)
+                    hidden = original(clone, [hidden], temb_for(key), self.segments[1], rope)
+                    if control:
+                        ranges, scale = self.wait_for(lambda: self.skip is not None, lambda: self.skip)
+                        add_skip(hidden, stream, clone.control.after_proj,
+                                 _rebase_ranges(ranges, self.rows[0], self.sequence), scale)
+                        if index == self.control_layers[-1]:
+                            stream = None
                     done = _record(_event(device), compute)
                     with self.cond:
                         self.done[index] = done
@@ -706,8 +784,31 @@ class _Session:
             self.temb_host[key] = _to_host(temb)
         return key
 
-    def block(self, index, block, x_list, temb):
+    def _start(self):
+        if self.worker is None:
+            self.loader = executor(self.devices[1].index or 0, "loader").submit(self._loader_job)
+            self.worker = executor(self.devices[1].index or 0).submit(self._worker_job)
+
+    def _post(self, mapping, key, value):
+        with self.cond:
+            mapping[key] = value
+            self.cond.notify_all()
+
+    def post_skip(self, ranges, scale):
+        """The rows that receive the ControlNet skips (full-sequence ranges) and their scale: the same for every
+        control block of a pass, sent once to the secondary GPU."""
+        if self.skip is None:
+            with self.cond:
+                self.skip = ([(int(first), int(last)) for first, last in ranges], float(scale))
+                self.cond.notify_all()
+
+    def control_block(self, index, block, x_list, temb):
+        return self.block(index, block, x_list, temb, control=True)
+
+    def block(self, index, block, x_list, temb, control=False):
         try:
+            if control:
+                return self._control_block(index, block, x_list, temb)
             return self._block(index, block, x_list, temb)
         except (SPFailure, _Aborted):
             raise
@@ -724,14 +825,11 @@ class _Session:
             local = hidden[:self.rows[0]].clone()
             remote_host = _to_host(hidden[self.rows[0]:], pinned=False)
             del hidden
-            self.loader = executor(self.devices[1].index or 0, "loader").submit(self._loader_job)
-            self.worker = executor(self.devices[1].index or 0).submit(self._worker_job, remote_host)
+            self._post(self.inputs, "hidden", remote_host)
+            self._start()
         else:
             local = _take(x_list)
-        key = self._send_temb(temb)
-        with self.cond:
-            self.messages[index] = key
-            self.cond.notify_all()
+        self._post(self.messages, index, self._send_temb(temb))
         _tls.sp = self.sides[0]
         try:
             output = original(block, [local], temb, self.segments[0], self.rope_local)
@@ -751,6 +849,30 @@ class _Session:
         self.check()
         self.finished = time.perf_counter()
         return full
+
+    def _control_block(self, index, block, x_list, temb):
+        """A ControlNet-Union block (run by WanGP before the main block it feeds), on this GPU's rows of the control
+        stream. The first one receives the full stream, built by WanGP from the whole sequence."""
+        original = _state["orig_block_forward"]
+        if index not in self.control_set:
+            raise SPFailure(f"unexpected control block {index}")
+        if index == self.control_layers[0]:
+            stream = _take(x_list)
+            local = stream[:self.rows[0]].clone()
+            remote_host = _to_host(stream[self.rows[0]:], pinned=False)
+            del stream
+            self._post(self.inputs, "control", remote_host)
+            self._start()
+        else:
+            local = _take(x_list)
+        self._post(self.control_messages, index, self._send_temb(temb))
+        _tls.sp = self.sides[0]
+        try:
+            output = original(block, [local], temb, self.segments[0], self.rope_local)
+        finally:
+            _tls.sp = None
+        self.check()
+        return output
 
     # --- end of pass ---------------------------------------------------------------------------------------------------
     def close(self, completed):
@@ -786,12 +908,16 @@ class _Session:
         weights = total(self.sides[1].weight_stalls)
         primary, secondary = (d.index or 0 for d in self.devices)
         share = 100.0 * self.rows[0] / self.sequence
-        if abs(stall0 - stall1) < max(0.02 * wall, 0.15 * max(stall0, stall1)):
+        # Each GPU's own work: the pass minus its waits for the other GPU (and for weights). Comparing the waits alone
+        # misleads: a GPU also waits for the other's keys and values in the middle of every block. The share that gives
+        # both GPUs the same work time is suggested.
+        busy0, busy1 = max(wall - stall0, 1e-6), max(wall - stall1 - weights, 1e-6)
+        rate0, rate1 = busy0 / self.rows[0], busy1 / self.rows[1]
+        suggested = int(round(100.0 * rate1 / (rate0 + rate1)))
+        if abs(suggested - round(share)) <= 1:
             hint = "balanced share"
-        elif stall0 > stall1:
-            hint = f"cuda:{primary} waits more: raise its share"
         else:
-            hint = f"cuda:{secondary} waits more: lower the share of cuda:{primary}"
+            hint = f"suggested share of cuda:{primary}: {suggested} %"
         vram = ""
         if _is_cuda(self.devices[1]):
             peak = torch.cuda.max_memory_allocated(self.devices[1]) - getattr(self, "vram_start", 0)
@@ -800,7 +926,8 @@ class _Session:
                   f"head{'s' if self.chunk_heads > 1 else ''}), {self.rows[0]} on cuda:{primary} "
                   f"({share:.0f} %), {self.rows[1]} on cuda:{secondary} | waits for the other GPU: cuda:{primary} "
                   f"{stall0:.2f} s, cuda:{secondary} {stall1:.2f} s ({hint}) | cuda:{secondary} waited {weights:.2f} s "
-                  f"for weights{vram}.")
+                  f"for weights{vram}"
+                  f"{f' | ControlNet: {len(self.control_layers)} control blocks split too' if self.control_layers else ''}.")
         _state["last_report"] = report
         print(f"[Multi-GPU] {report}")
 
@@ -810,6 +937,10 @@ class _ForwardContext:
         self.model, self.cfg = model, cfg
         self.main_thread = threading.current_thread()
         self.index = {id(block): i for i, block in enumerate(model.blocks)}
+        self.control_layers = tuple(getattr(model, "control_layers", ()) or ())
+        self.control_index = {id(model.blocks[i].control): i for i in self.control_layers
+                              if hasattr(model.blocks[i], "control")}
+        self.control_active = False   # set for each pass: True when it has a control video (payload control_rows)
         self.session = None
         self.decided = False
 
@@ -823,12 +954,17 @@ def _ineligible(model, video_x, payload, spectrum, first_block_cache, cfg):
         return "off"
     if _state["broken"]:
         return "broken"
+    if torch.is_tensor(video_x) and video_x.dim() == 5 and video_x.shape[2] == 1 and not cfg.get("denoise_images", False):
+        return "still image (tick 'Also split still images' in the Multi-GPU tab to share it)"
     if _state["test_secondary"] is None and (not video_x.is_cuda or torch.cuda.device_count() < 2):
         return "needs two visible GPUs"
+    if _state["test_secondary"] is None:
+        primary_index = video_x.device.index if video_x.device.index is not None else torch.cuda.current_device()
+        problem = kernel_compat.prepare_secondary(primary_index, 1 if primary_index == 0 else 0)
+        if problem is not None:
+            return f"WGPKernels could not be set up for the second GPU ({problem})"
     if spectrum is not None or first_block_cache is not None:
         return "Spectrum or first block cache is on"
-    if payload.get("control_rows") is not None:
-        return "ControlNet is on"
     attn = model.blocks[0].attn
     if not hasattr(attn, "q_proj"):
         return "the q/k/v projections are fused in this checkpoint"
@@ -836,9 +972,13 @@ def _ineligible(model, video_x, payload, spectrum, first_block_cache, cfg):
         return "VDN attention is on"
     if hasattr(model, "veda_attention") or hasattr(attn, "veda"):
         return "VEDA attention is on"
-    if getattr(model, "control_layers", ()):
-        return "this model has ControlNet layers"
-    try:
+    layers = tuple(getattr(model, "control_layers", ()) or ())
+    if payload.get("control_rows") is not None:
+        if not layers or any(not hasattr(model.blocks[i], "control") for i in layers) or _state["orig_add_control_skip"] is None:
+            return "this version of the H3 ControlNet code is not supported"
+    if cuda_graphs_on(model.blocks[0]):
+        return "CUDA graphs are on"
+    try:   # WanGP before v18.17
         from models.minimax_h3.transformer import _graph_manager
         if _graph_manager(model.blocks[0]) is not None:
             return "CUDA graphs are on"
@@ -866,6 +1006,7 @@ def _split_forward(self, cfg, args, kwargs):
     video_x, audio_x, sigma_video, sigma_audio, context, payload = args
     spectrum, first_block_cache = kwargs["spectrum"], kwargs["first_block_cache"]
     ctx = _ForwardContext(self, cfg)
+    ctx.control_active = payload.get("control_rows") is not None and bool(ctx.control_index)
     previous = getattr(_tls, "forward", None)
     _tls.forward = ctx
     completed = False
@@ -897,7 +1038,11 @@ def _patched_block_forward(self, x_list, temb, segments, rope, residual_signatur
         if residual_signature_elements:
             return original(self, x_list, temb, segments, rope, residual_signature_elements)
         return original(self, x_list, temb, segments, rope)
+    control = False
     index = ctx.index.get(id(self))
+    if index is None:
+        index = ctx.control_index.get(id(self)) if ctx.control_active else None
+        control = index is not None
     if index is None:
         return original(self, x_list, temb, segments, rope)
     if index == 0 and not ctx.decided:
@@ -905,7 +1050,10 @@ def _patched_block_forward(self, x_list, temb, segments, rope, residual_signatur
         hidden = x_list[0]
         sol = getattr(ctx.model, "sol_attention", None)
         if hidden.shape[0] < MIN_TOKENS:
-            pass
+            _state["last_report"] = (f"Last H3 denoising pass on one GPU: {hidden.shape[0]} tokens, under the "
+                                     f"{MIN_TOKENS} needed to share the work.")
+            warn_once(f"denoise_short_{hidden.shape[0]}", f"H3 denoising runs on one GPU: {hidden.shape[0]} tokens, "
+                                                          f"under the {MIN_TOKENS} needed to share the work.")
         elif sol is not None and getattr(sol, "enabled", False):
             warn_once("denoise_sol", "H3 denoising runs on one GPU: Sol (sparse) attention is on.")
         else:
@@ -922,7 +1070,26 @@ def _patched_block_forward(self, x_list, temb, segments, rope, residual_signatur
                 raise SPFailure(f"{type(exc).__name__}: {exc}") from exc
     if ctx.session is None:
         return original(self, x_list, temb, segments, rope)
+    if control:
+        return ctx.session.control_block(index, self, x_list, temb)
     return ctx.session.block(index, self, x_list, temb)
+
+
+def _patched_add_control_skip(hidden, stream, after_proj, row_ranges, scale):
+    """MiniMaxH3Model._add_control_skip during a split pass: WanGP's thread holds the rows of the primary GPU only (the
+    full sequence after the last block): it adds the skips of its rows, and the secondary GPU adds those of its own."""
+    original = _state["orig_add_control_skip"]
+    ctx = getattr(_tls, "forward", None)
+    session = None if ctx is None else ctx.session
+    if session is None or not session.control_layers or getattr(_tls, "sp", None) is not None \
+            or threading.current_thread() is not ctx.main_thread:
+        return original(hidden, stream, after_proj, row_ranges, scale)
+    ranges = list(row_ranges)
+    session.post_skip(ranges, scale)
+    rows = session.rows[0]
+    if stream.shape[0] != rows or hidden.shape[0] not in (rows, session.sequence):
+        raise SPFailure(f"unexpected ControlNet skip shapes {tuple(hidden.shape)} / {tuple(stream.shape)}")
+    return original(hidden, stream, after_proj, _rebase_ranges(ranges, 0, rows), scale)
 
 
 def _patched_qkv_attention(x_list, q_proj, k_proj, v_proj, heads, head_dim, norm_rope, **kwargs):
@@ -975,4 +1142,9 @@ def install():
         _state["orig_model_forward"] = MiniMaxH3Model.forward
         _patched_model_forward._wangp_mgpu = True
         MiniMaxH3Model.forward = _patched_model_forward
+    skip = MiniMaxH3Model.__dict__.get("_add_control_skip")
+    if skip is not None and not getattr(MiniMaxH3Model._add_control_skip, "_wangp_mgpu", False):
+        _state["orig_add_control_skip"] = MiniMaxH3Model._add_control_skip
+        _patched_add_control_skip._wangp_mgpu = True
+        MiniMaxH3Model._add_control_skip = staticmethod(_patched_add_control_skip)
     _state["installed"] = True

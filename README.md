@@ -3,12 +3,15 @@
 Use two NVIDIA GPUs in **the same render** in [WanGP](https://github.com/deepbeepmeep/Wan2GP), with a manual work split
 so that GPUs of different speeds (same generation) can be paired, and without giving up WanGP's RAM offloading.
 
-> **Status: v0.3.8, experimental.** The plugin uses the second GPU for the three stages of a **MiniMax H3** render:
-> **denoising** (new in v0.3, experimental, off by default: both GPUs work on the same step, each on part of the tokens),
-> **VAE decoding** (split across `cuda:0` and `cuda:1`) and the **text encoder** (its last layers kept and run on
-> `cuda:1`). Contributions are welcome.
+> **Status: v0.5.3, experimental.** The plugin uses the second GPU for:
+> - **MiniMax H3**: **denoising** (both GPUs work on the same step, each on part of the tokens), **VAE decoding** and the
+>   **text encoder** (its last layers kept and run on `cuda:1`);
+> - **LTX-2** (2.3 Distilled 1.0 and 1.1, 2.5 Distilled, and their Dev versions; new in v0.5): **denoising** (each GPU on part of the video tokens) and **VAE
+>   decoding** (spatial tiles).
+>
+> Contributions are welcome.
 
-## What it does
+## What it does (MiniMax H3)
 
 ### Denoising (since v0.3, experimental)
 
@@ -30,8 +33,8 @@ chunk while the previous chunk is being attended, so that every token still atte
   thread streams each block's weights (and active LoRAs) from the same Reserved RAM that MMGP uses for `cuda:0`, two
   blocks ahead of the compute. `cuda:1` needs about 2 to 4 GB of free VRAM; if the text encoder layers kept there leave
   too little, they are freed automatically.
-- Work share: a separate slider, like the VAE one. After each denoising pass the console says which GPU waited for the
-  other; raise the share of `cuda:0` when `cuda:0` waits, lower it when `cuda:1` waits.
+- Work share: a separate slider, like the VAE one. After each denoising pass the console line suggests a share computed
+  from each GPU's own work time (or says "balanced share").
 - First measurement (v0.3.0, RTX 5080 `cuda:0` + RTX 5070 Ti `cuda:1`, share 56 %, H3 FL2VA Pruned 20B INT8 + turbo
   LoRA, 1280x704, 124 frames, 33022 tokens): **16.6 s -> 11.4 to 11.7 s per denoising step (-30 %)**, with the
   waits of the two GPUs balanced (about 1.2 s each per step, the time spent waiting for keys and values). The physical
@@ -40,15 +43,27 @@ chunk while the previous chunk is being attended, so that every token still atte
   "2 Phases Plus" plugin): phase 1 (37703 tokens) 20.4 -> 13.2 s per step (-35 %), phase 2 (116634 tokens) 97.2 -> 61.8 s
   per step (-36 %), VAE decoding 50.4 -> 40.1 s, **whole render 345 s -> 235 s (-32 %)**. Peak VRAM on `cuda:1`: 2.5 GB
   and 5.2 GB.
+- Two identical GPUs (v0.4.5, two RTX 5080, H3 Ref2VA Pruned INT8 with 5 RefMods, 15 s at 1088x832, two phases, 50/50
+  share): phase 1 (35182 tokens) 12.0 -> 7.5 s per step (-37 %), phase 2 (106123 tokens) 70.7 -> 37.5 s per step
+  (-47 %), VAE decoding 23.7 -> 18.4 s, **whole render 216.5 s -> 128.9 s (-40 %)**.
 - Long sequence (v0.3.5, same setup, 20 s without sliding window, 481 frames): phase 1 (45836 tokens) 16.4 s per step,
   phase 2 (147972 tokens) 81.9 s per step with 5.6 GB peak on `cuda:1`; smaller exchange chunks cut the waits of
   phase 2 from 3.7 / 6.5 s to 0.7 / 1.4 s per step (87.1 -> 81.9 s).
 - Safety net: if anything fails on the multi-GPU path (not enough VRAM, an unsupported option, an error on `cuda:1`),
   the denoising pass is computed again on one GPU, the render goes on, and the feature stays off until you switch it off
   and on again. The tab shows the reason.
+- ControlNet-Union models are split too: WanGP's FL2VA ControlNet-Union (33B and Pruned 20B) and the Ref2VA
+  ControlNet-Union models added by the `wan2gp-minimax-h3-ref2va-controlnet` plugin. Their control blocks run on the same
+  rows split as the main blocks (each GPU computes its rows of the control stream, with the same key/value exchange), and
+  each GPU adds the control skips to its own rows. The console line of each pass then ends with "ControlNet: N control
+  blocks split too". Without a control video the control blocks stay idle, as on one GPU.
 - A pass runs on one GPU when it uses an option this version does not split: Sol (sparse) or VEDA attention, VDN,
-  ControlNet, Spectrum or first block caching, CUDA graphs, or a sequence shorter than 4096 tokens (images). The console
-  says so once.
+  Spectrum or first block caching, CUDA graphs, or a sequence shorter than 2048 tokens (images smaller than
+  about 720x720). The console says so once.
+- Still images (H3's Text to Image mode) stay on one GPU unless **Also split still images** is ticked: an image has too
+  few tokens (about 4100 at 2048x2048) to make up for the exchanges between the GPUs. Measured on an RTX 5080 + RTX 5070
+  Ti at 2048x2048, 20 steps: 2.06 s per step on one GPU, 2.4 s on two. The VAE decoding of images is still split
+  (9.0 s down to 6 to 7.5 s at 2048x2048).
 
 ### VAE decoding (since v0.1)
 
@@ -89,12 +104,109 @@ result comes back to `cuda:0`.
   the VAE split is off), the plugin uses as many of the last layers as fit and says so in the console.
 - The first 3 layers (which receive Qwen3-VL's DeepStack image features) always stay on `cuda:0`, so N is at most 47.
 
+## What it does (LTX-2, since v0.5)
+
+Ported from the "Multi-GPU LTX-2" plugin (v0.2.1, written for WanGP 11.22) and adapted to WanGP v18.17+ (mmgp 4.x).
+That plugin measured, on two RTX 5080 with WanGP 11.22 and LTX-2.3 Distilled INT8, a 10 s 1080p render going from
+2 min 37 s on one GPU to 1 min 45 s on two (-33 %; stage 2 of the distilled pipeline -40 %).
+
+Models (WanGP v18.21): **LTX-2.3 Distilled 1.0** and **1.1** (and Dev), **LTX-2.5 Distilled** (and Dev). They share
+WanGP's LTX-2 transformer and video decoder code; what differs is handled as follows:
+
+| Difference | Effect on the split |
+| --- | --- |
+| Checkpoint formats: quanto INT8 (2.3 1.0, `quanto_int8`; 2.3 1.1, `quanto_bf16_int8`), **INT8 ConvRot** (2.5, `int8_convrot`), BF16, NVFP4 (2.5) | the block copies of `cuda:1` take the weights in their own format (ConvRot: the rotation group of each layer comes with the copy) |
+| LTX-2.5: feed-forward without bias, learned **keyframe embedding** (start/end images, injected frames) | the embedding is added before the blocks, on the full sequence: nothing to split |
+| LTX-2.5: ancestral sampler of the distilled pipeline, Gemma 4 text encoder | outside the blocks (the text encoder is not split for LTX-2) |
+| LTX-2.3 1.1: HDR IC-LoRA added automatically | IC-LoRA reference tokens are video tokens like the others |
+
+Tested on the CPU against WanGP v18.21's code (INT8 ConvRot loaded through mmgp's quanto router, as WanGP loads it).
+NVFP4 checkpoints are not covered by the tests.
+
+Measured with this version on two RTX 5080 (PCIe 5.0 x8 each, Windows), WanGP v18.21, LTX-2.3 Distilled quanto INT8,
+WGPKernels, 121 frames: **1 min 34 s → 1 min 18 s (-18 %)**.
+
+| Stage | Video tokens | One GPU | Two GPUs |
+| --- | --- | --- | --- |
+| Stage 1 (8 steps, low resolution) | 15 004 | 2.89 s/step | 2.9 to 3.0 s/step (no gain) |
+| Stage 2 (3 steps, full resolution) | 60 016 | 17.5 s/step | 11.0 s/step (-37 %) |
+| Rest (text encoder, VAE single tile, audio) | | about 20 s | about 20 s |
+
+Why stage 1 gains nothing: the INT8 model (18.5 GB) does not fit in 16 GB, so each GPU streams all the weights from RAM
+at every step (about 18 GB), and the video self-attention exchange adds about 12 GB per GPU and step (6 GB each way).
+Windows gives each GeForce a single copy engine (28.7 GB/s on PCIe 5.0 x8, sending and receiving share it), so about
+30 GB per step and GPU take at least 1.05 s, against about 1.45 s of compute each GPU has left with half the tokens. The
+exchange can only hide behind the attention of the same block, which is short at low resolution: each GPU waits about
+1.1 s per step. At full resolution the attention costs 16 times more and hides the exchange.
+
+### Denoising
+
+LTX-2 is a **dual-stream** transformer: each of its 48 blocks updates a **video stream** (thousands of tokens) and an
+**audio stream** (a few hundred tokens). The plugin cuts the **video** sequence in two: the first rows stay on `cuda:0`,
+the rest are denoised on `cuda:1`.
+
+- Everything that works token by token (projections, norms, AdaLN modulation, feed-forward, text cross-attention,
+  audio-to-video cross-attention) runs on each GPU for its own rows only. The **audio stream is small, so each GPU
+  computes all of it**.
+- Only two attentions need keys/values from *all* the video rows:
+  - the **video self-attention**: the two GPUs swap their keys and values through pinned RAM, chunk by chunk, as for H3;
+  - the **video-to-audio cross-attention**: its queries are the audio tokens, which both GPUs hold. Each GPU attends them
+    over its own video rows and keeps the log-sum-exp of the scores; the GPUs swap these partial results (a few MB
+    instead of hundreds of MB of keys/values) and merge them exactly (in float32).
+- **Rotary embeddings** (LTX-2's `RopeCache`) and **per-frame timesteps** are cut exactly at the split point; when the
+  timesteps are given per latent frame (the usual case), the split falls on a frame boundary.
+- Same computation: any number of steps, distilled or dev models, LoRAs (IC-LoRAs included), CFG "joint" passes and STG
+  perturbations. Expect the same video up to tiny floating point differences.
+- Memory: `cuda:0` keeps WanGP's memory manager; `cuda:1` streams each block's weights from the same RAM, two blocks
+  ahead, and keeps the copies of the blocks between the steps of a generation (dropped when it ends, when the VAE decode
+  starts, after an interruption or a failure). `cuda:1` needs about 2 to 5 GB of free VRAM; the plugin checks it before
+  each pass.
+- WanGP v18 attention: LTX-2 now reaches the attention through `attention_kit` (self-attentions, and cross-attentions
+  with **Attention Head Split**) or by calling `pay_attention` itself (other cross-attentions, a backend forced by the
+  model). Both paths are intercepted; a split attention always uses all its heads at once (both GPUs must exchange the
+  same chunks), so Attention Head Split does not apply to the two distributed attentions.
+- A pass stays on one GPU (with a console message) with fewer than 2048 video tokens, `torch.compile`, CUDA graphs, a
+  batch of several videos, or a self-attention or audio/video cross-attention mask (some audio-paired modes).
+- Work share: its own slider. The console line of each pass suggests a share; about 48 % was the advice for two
+  identical cards with WanGP 11.22 (`cuda:0` also runs WanGP's memory manager).
+
+### VAE decoding
+
+WanGP v18 rewrote LTX-2's video decoder: it now cuts the frame into **spatial tiles** (the fewest that fit the **VAE
+tiling** setting) and decodes each tile **streamed latent frame after latent frame**, with no temporal tiles (every
+frame is exactly the one the whole video would give). The time axis can therefore not be shared; the tiles are:
+
+- tile 0 stays on `cuda:0` (so both GPUs start at once), the others are spread according to the VAE share. `cuda:1`
+  decodes its tiles ahead of time with its own copy of the decoder and records, latent frame by latent frame, what its
+  stream produces; WanGP's loop then feeds these frames to its own blending code in the same order. The video is
+  identical to the one-GPU decode (checked bit for bit in the tests).
+- **A frame decoded as a single tile stays on one GPU** — often the case with the default VAE tiling, which fits a
+  1080p frame in one tile. A smaller VAE tiling size gives 2 tiles or more. With 2 tiles, the share must be 50 % or
+  less for `cuda:1` to get one.
+- A decoded tile waits in RAM until its turn (up to a few GB for a long 1080p video, one tile at a time).
+- If `cuda:1` fails to decode a tile, that tile and the remaining ones are decoded on `cuda:0`: the video is still
+  complete and identical.
+- Cost: a copy of the decoder on `cuda:1` (built once from the tensors MMGP holds in RAM), freed by **Free secondary
+  GPU memory**, by unticking the LTX-2 VAE split or by disabling the plugin.
+
+### Text encoder
+
+Not split for LTX-2 (Gemma 3 runs once per new prompt and is cached by WanGP).
+
 ## Requirements
 
-- WanGP v18 or later, with a MiniMax H3 model (FL2VA, Ref2VA, pruned or full; INT8, FP8 or BF16 VAE).
-- Two NVIDIA GPUs of the same generation (tested target: RTX 5080 + RTX 5070 Ti, Blackwell).
+- WanGP v18 or later, with a MiniMax H3 model (FL2VA, Ref2VA, pruned or full; INT8, FP8 or BF16 VAE). LTX-2 support
+  needs WanGP v18.17 or later (tested against v18.17 and v18.21); with an older WanGP the LTX-2 section of the tab says it
+  is unavailable and the H3 features work as before.
+- Two NVIDIA GPUs of the same generation (tested: RTX 5080 + RTX 5070 Ti, and two RTX 5080, Blackwell).
 - Windows or Linux. No NCCL, no `torch.distributed`, no peer-to-peer GPU access needed: everything runs in WanGP's process.
 - VAE tiling on (the H3 default). With tiling off there is only one tile per clip and nothing to split.
+- Any INT8 kernel backend of WanGP (PyTorch, Triton, Comfy Kitchen, WGPKernels). WGPKernels 1.1.2 is written for one GPU
+  per process (its native library raises each GEMM kernel's shared memory limit once, but that limit is per GPU), so the
+  plugin gives each secondary GPU its own copy of that library: a file named like `wgp_int8_mgpu_cuda1.dll` written next
+  to the original (or in the temp folder), loaded only for the INT8 work of that GPU. WanGP's Triton INT8 kernels time
+  their configurations inside a CUDA graph the first time a shape is seen; the plugin runs these tuning sessions one at
+  a time and in CUDA's "thread_local" capture mode, so the other GPU can keep working meanwhile.
 
 ## Install
 
@@ -110,28 +222,41 @@ In the Media Generator, switch to Advanced Mode and open the **Multi-GPU** tab (
 
 - **Enable multi-GPU**: master on/off switch. Off means WanGP behaves exactly as without the plugin. It is always off
   when WanGP starts, so the second GPU is never used by accident; the other settings of the tab are remembered.
+- **Attention heads per exchanged chunk** (H3 and LTX-2): automatic by default (4, fewer on long videos so that a chunk
+  stays under 64 MB). Smaller chunks shorten the waits between the GPUs; larger ones mean fewer, bigger attention calls.
+
+**MiniMax H3**
+
 - **Denoising** (experimental)
   - **Split H3 denoising across cuda:0 and cuda:1**: off by default.
   - **Denoising work share of cuda:0 (%)**: share of the tokens denoised on `cuda:0`. Default 50; about 56 for an
     RTX 5080 (`cuda:0`) with an RTX 5070 Ti (`cuda:1`).
-  - **Attention heads per exchanged chunk**: automatic by default (4, fewer on long videos so that a chunk stays under
-    64 MB). Smaller chunks shorten the waits between the GPUs; larger ones mean fewer, bigger attention calls.
+  - **Also split still images (Text to Image)**: off by default; needs **Enable multi-GPU** and the denoising split. May
+  be slower than one GPU (see above).
 - **VAE decoding**
   - **Split H3 VAE decoding across cuda:0 and cuda:1**: on by default (once the master switch is on).
   - **Work share of cuda:0 (%)**: share of the tiles decoded on `cuda:0`; `cuda:1` gets the rest. Default 50.
 - **Text encoder**
   - **Keep the last text encoder layers on cuda:1**: off by default, and ignored while denoising is split.
   - **Text encoder layers kept on cuda:1**: N, from 0 to 47. Default 20 (about 9.4 GB with the INT8 text encoder).
-- The tab lists the GPUs WanGP sees, with their `cuda:N` numbers, and the result of the last text encoding and decode.
+
+**LTX-2**
+
+- **Split LTX-2 denoising across cuda:0 and cuda:1**: on by default (once the master switch is on).
+- **LTX-2 denoising work share of cuda:0 (%)**: share of the video tokens denoised on `cuda:0`. Default 50.
+- **Split LTX-2 VAE decoding across cuda:0 and cuda:1**: on by default (once the master switch is on).
+- **LTX-2 VAE work share of cuda:0 (%)**: share of the spatial tiles decoded on `cuda:0`. Default 50.
+
+The tab lists the GPUs WanGP sees, with their `cuda:N` numbers, and the result of the last pass and decode of each
+feature.
 
 Settings are saved in `settings.json` next to the plugin and apply to the next prompt or decode, including queued jobs.
 
 ### Choosing the number of text encoder layers
 
-More layers on `cuda:1` means faster new prompts and less free VRAM on `cuda:1`. Today `cuda:1` is only used for the VAE
-copy and the text encoder, so on a 16 GB card 20 is a safe value and the plugin trims the number if it does not fit.
-When denoising is split across both GPUs (next milestone), that VRAM will be needed for denoising and this default will
-change.
+More layers on `cuda:1` means faster new prompts and less free VRAM on `cuda:1`. The text encoder split is skipped while
+the H3 denoising split is on (that VRAM goes to denoising, worth far more). Without it, 20 is a safe value on a 16 GB
+card, and the plugin trims the number if it does not fit.
 
 ### Choosing the work share
 
@@ -154,7 +279,12 @@ CUDA numbers GPUs from fastest to slowest, so `cuda:0` is usually the faster one
 | `common.py` | Shared helpers: GPU list, one worker thread per secondary GPU, copies through pinned RAM, tensor sizes. |
 | `vae_split.py` | VAE split: patches `MiniMaxH3VideoViTDecoder3d.forward`, builds and keeps the decoder copy, runs the second part in a worker thread bound to the secondary GPU. |
 | `te_split.py` | Text encoder split: loads the last N language layers from the checkpoint onto the secondary GPU and runs them there. |
-| `denoise_split.py` | Denoising split: token rows per GPU, hook-free copies of the blocks for the secondary GPU, weight streaming, key/value exchange. |
+| `denoise_split.py` | H3 denoising split: token rows per GPU, hook-free copies of the blocks for the secondary GPU, weight streaming, key/value exchange. |
+| `kernel_compat.py` | WanGP's INT8 kernels on two GPUs: a copy of the WGPKernels library per secondary GPU, Triton tuning one session at a time. |
+| `clones.py` | Hook-free copies of MMGP-managed modules (LTX-2 blocks and decoder), tensors pointing to MMGP's CPU tensors. |
+| `ltx2_denoise.py` | LTX-2 denoising split: video rows per GPU, audio on both, RoPE/timestep slicing, key/value exchange, partial attention merge. |
+| `ltx2_vae.py` | LTX-2 VAE split: spatial tiles of the streamed decoder, decoder copy, secondary decode thread. |
+| `tests/` | CPU checks of the LTX-2 splits (no GPU needed): `python -I tests/test_ltx2_denoise.py <WanGP folder> <plugins folder>`, same for `test_ltx2_vae.py`. |
 
 Hooks installed at WanGP startup, before any model is loaded:
 
@@ -184,6 +314,20 @@ Hooks installed at WanGP startup, before any model is loaded:
 The block copies for `cuda:1` are the same module objects rebuilt without MMGP's hooks: their tensors point to MMGP's
 pinned CPU tensors, swapped for `cuda:1` copies while a block runs. LoRA linears keep MMGP's LoRA forward with
 `cuda:1` copies of the adapter weights; scales and step schedules are read from the model, as on `cuda:0`.
+
+LTX-2 hooks (installed after the H3 ones):
+
+9. `LTXModel._process_transformer_blocks` and `_process_transformer_blocks_joint` are replaced: when the split applies,
+   the blocks' arguments (`TransformerArgs`) are cut, `cuda:0` runs WanGP's real blocks on its rows in the same loop as
+   WanGP, and a worker thread runs hook-free copies of the 48 blocks on the rows of `cuda:1`.
+10. `pay_attention` as imported by LTX-2's attention module, and `attention_kit.qkv_attention` /
+    `attention_kit.cross_qkv_attention` (above the H3 wrapper) are wrapped: inside a split pass, when the calling
+    Attention module is a block's `attn1` or `video_to_audio_attn`, the attention goes to the plugin's distributed
+    attention.
+11. `VideoDecoder.tiled_decode` is wrapped: when the frame has 2 tiles or more, the decoder's `stream_step` is replaced
+    for the duration of the decode so that the tiles of `cuda:1` are fed from its recorded output.
+12. At the first split pass, `LTX2.generate` is wrapped so that the block copies kept between steps are dropped when a
+    generation ends.
 
 When the plugin is disabled, every hook calls the original WanGP code directly.
 
@@ -233,8 +377,8 @@ used, and the `[Multi-GPU]` and `[H3 Profiler]` console lines for the same rende
 
 ## Known limitations
 
-- MiniMax H3 only.
-- Denoising: standard attention path only (see the list of options that keep a pass on one GPU above).
+- MiniMax H3 and LTX-2 only.
+- Denoising: standard attention path only (see the lists of options that keep a pass on one GPU above).
 - Two GPUs: `cuda:0` and `cuda:1`. More GPUs are not used.
 - The first decode after enabling the plugin also builds the decoder copy on `cuda:1` (a few seconds, plus 2 to 3 GB of RAM
   while loading).
@@ -244,8 +388,65 @@ used, and the `[Multi-GPU]` and `[H3 Profiler]` console lines for the same rende
   language layers are split.
 - VAEs loaded by other code paths than the H3 model loader (for example some post-processing tools) are decoded on one GPU.
 
+## Known issues of WanGP worked around by the plugin
+
+- **WanGP v18.21, WGPKernels + a plain quanto INT8 checkpoint** (for example `ltx-2.3-22b-distilled_..._quanto_int8`):
+  `AttributeError: 'QLinearQuantoRouter' object has no attribute '_convrot_group_size'` at the first LTX-2 step, with or
+  without multi-GPU. WanGP's `int8_backend.linear_multi` (one input shared by several projections) reads that attribute
+  without a default, which only ConvRot INT8 layers have. The plugin installs a guard at startup, whatever its switches:
+  in that case only, each projection runs on its own, the path WanGP takes for projections it cannot share (same
+  result). Without the plugin, choose another INT8 backend (Comfy Kitchen or Triton) for such checkpoints.
+
 ## Changelog
 
+- **0.5.3**: LTX-2.3 Distilled 1.1 and LTX-2.5 Distilled (INT8 ConvRot checkpoint, keyframe embedding, feed-forward
+  without bias) checked and documented; new LTX-2.5 cases in the tests. No change was needed in the split itself.
+- **0.5.2**: an LTX-2 VAE decode that stays on one GPU (single spatial tile, no tile for `cuda:1`) now prints its
+  reason in the console. First LTX-2 measurements on WanGP v18.21 in the README.
+- **0.5.1**: guard for the WanGP v18.21 bug above (LTX-2.3 quanto INT8 with WGPKernels failed at the first step, plugin
+  on or off).
+- **0.5.0**: **LTX-2 support**, from the "Multi-GPU LTX-2" plugin (v0.2.1, WanGP 11.22), adapted to WanGP v18.17+:
+  - denoising split (video rows per GPU, audio on both, exact RoPE and timestep slicing, key/value exchange for the
+    video self-attention, partial attention merge for the video-to-audio cross-attention), now catching both attention
+    paths of WanGP v18 (`attention_kit` and `pay_attention`), and staying on one GPU with CUDA graphs or audio/video
+    cross-attention masks;
+  - VAE split rewritten for WanGP v18's streamed decoder (spatial tiles instead of temporal ones);
+  - its own section in the tab (denoising and VAE switches and shares); the attention chunk setting is shared.
+  - CPU tests for LTX-2 in `tests/` (all checks pass on WanGP v18.17 and v18.21; the decode is bit-identical).
+  H3: the CUDA graph check of the denoising split works again with WanGP v18.17+ (the function it used was removed, so a
+  pass could have been split with CUDA graphs on); the plugin's RAM buffers name the CPU explicitly (WanGP may generate
+  inside `with torch.device("cuda")`); console status lines say which model they are about.
+- **0.4.6**: the console line of each denoising pass suggests a share ("suggested share of cuda:0: 54 %") computed from
+  each GPU's own work time, instead of comparing their waits, which pointed the wrong way (a GPU also waits for the
+  other's keys and values in the middle of every block). Measured with two RTX 5080: Ref2VA Pruned, 15 s at 1088x832, two
+  phases, 216.5 s on one GPU, 128.9 s on two at 50/50 (-40 %; denoising -44 %, VAE -22 %).
+- **0.4.5**: the 0.4.4 transfer of the Ref2VA ControlNet plugin's control timestep embedding read a tensor version
+  counter, which inference tensors do not have ("Inference tensors do not track version counter"). Fixed; the test now
+  runs in inference mode, as WanGP does.
+- **0.4.4**: with the Ref2VA ControlNet-Union plugin, the denoising split failed at the first control block
+  (`CUDA error: invalid argument`): the plugin's control timestep embedding lives on the primary GPU and was copied
+  directly to the secondary one, which these cards cannot do. It now goes through RAM, once per pass. The failed copy
+  also left a CUDA error pending in the secondary GPU's thread, which the VAE decoding then reported and stopped the
+  render: every job on the secondary GPU now first clears any error left by a previous one.
+- **0.4.3**: ControlNet-Union support for the denoising split (it ran on one GPU before): WanGP's FL2VA ControlNet-Union
+  models and the Ref2VA ControlNet-Union models of the `wan2gp-minimax-h3-ref2va-controlnet` plugin. The control blocks
+  are split like the main blocks and each GPU applies the control skips to its own rows; same output as one GPU in the
+  tests (control at 30, 56 and 80 % shares, no control video, and the Ref2VA plugin's replaced control AdaLN). Layers
+  called by a forward that another plugin replaced now take their input on the device of their own weights.
+- **0.4.2**: with the Triton INT8 kernels, the VAE decoding failed on the second GPU with `CUDA error: the operation
+  cannot be performed in the present state`: the first-time tuning of a Triton kernel on one GPU captured a CUDA graph in
+  "global" mode, which forbids allocations on every other thread. Triton tuning sessions now run one at a time, in
+  "thread_local" capture mode. Other CUDA graphs and the tuning results are unchanged.
+- **0.4.1**: WGPKernels (WanGP's own INT8 kernels) failed on the second GPU with `INT8 GEMM launch failed (CUDA error 1)`,
+  in the denoising and the VAE decoding: its native library sets the shared memory limit of each kernel once per
+  process, for the first GPU only. The secondary GPU now loads its own copy of the library; the library's workspace size
+  query and tuning cache are also made safe for two GPUs working at the same time. Nothing changes with the other INT8
+  backends or on one GPU.
+- **0.4.0**: still images measured slower on two GPUs (2048x2048: 2.4 s per step instead of 2.06 s), so their denoising
+  stays on one GPU unless the new **Also split still images** box is ticked (off by default). Their VAE decoding is still
+  split, which is faster.
+- **0.3.9**: still images (Text to Image) can use both GPUs: the split now starts at 2048 tokens instead of 4096, so
+  1024x1024 and 1280x720 images are split; smaller ones stay on one GPU and the console says why.
 - **0.3.8**: **Enable multi-GPU** is always off when WanGP starts (the other settings are still remembered). The model
   switch failure of 0.3.7 turned out to come from another plugin that kept the previous H3 pipeline alive; WanGP's
   `--ram-debug` report shows which object holds a released model, if it happens again. Real-use measurement with 1 head

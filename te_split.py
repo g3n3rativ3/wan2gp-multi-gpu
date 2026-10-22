@@ -26,8 +26,8 @@ import traceback
 import torch
 import torch.nn as nn
 
-from . import settings
-from .common import (executor, device_index, gpu_name, map_tensors, match_float_dtypes, module_bytes, other_gpu,
+from . import settings, kernel_compat
+from .common import (clear_stale_cuda_error, executor, device_index, gpu_name, map_tensors, match_float_dtypes, module_bytes, other_gpu,
                      to_pinned_host, warn_once)
 
 GB = 1024 ** 3
@@ -42,7 +42,7 @@ _state = {
     "installed": False,
     "orig_encode": None,       # original MiniMaxH3TextEncoder.encode
     "tail": None,              # {"key", "layers", "first", "device", "bytes"}
-    "last_report": "No multi-GPU text encoding yet.",
+    "last_report": "No multi-GPU H3 text encoding yet.",
 }
 
 
@@ -167,6 +167,7 @@ def _tail_for(text_encoder, wanted, index, reserve_gb):
 # ----------------------------------------------------------------------------------------------------------------------
 
 def _run_tail(layers, host_hidden, host_kwargs, index, owner):
+    clear_stale_cuda_error(index)
     device = torch.device("cuda", index)
     with torch.no_grad():
         hidden = host_hidden.to(device, non_blocking=True)
@@ -234,6 +235,8 @@ def _patched_encode(self, prompt, items, device, dtype):
     try:
         primary_index = device_index(device)
         index = other_gpu(primary_index)
+        if kernel_compat.prepare_secondary(primary_index, index) is not None:
+            return orig(self, prompt, items, device, dtype)
         reserve = RESERVE_WITH_VAE_GB if cfg["vae_enabled"] else RESERVE_ALONE_GB
         if cfg.get("denoise_enabled"):
             reserve = max(reserve, RESERVE_WITH_DENOISE_GB)

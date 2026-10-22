@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "vae_enabled": true,
+  "share_cuda0": 50,
+  "te_enabled": false,
+  "te_layers_cuda1": 20,
+  "denoise_enabled": false,
+  "denoise_share_cuda0": 50,
+  "denoise_chunk_heads": 0,
+  "denoise_images": false,
+  "ltx_denoise_enabled": true,
+  "ltx_denoise_share_cuda0": 50,
+  "ltx_vae_enabled": true,
+  "ltx_vae_share_cuda0": 50
+}
