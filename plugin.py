@@ -78,7 +78,7 @@ class MultiGPUPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PLUGIN_NAME
-        self.version = "0.5.3"
+        self.version = "0.5.4"
         self.description = ("Experimental multi-GPU support: MiniMax H3 (denoising, VAE decoding, text encoder) and LTX-2 "
                             "(denoising, VAE decoding) on two GPUs.")
 
@@ -95,6 +95,9 @@ class MultiGPUPlugin(WAN2GPPlugin):
                 traceback.print_exc()
         try:
             from . import kernel_compat
+            locks = kernel_compat.install_triton_locks()
+            if locks:
+                print(f"[Multi-GPU] Serialized for two GPUs: {', '.join(locks)} (see README, Known issues of WanGP).")
             if kernel_compat.install_wangp_fixes():
                 print("[Multi-GPU] Installed a fix for WanGP's shared INT8 projections with WGPKernels on non-ConvRot "
                       "checkpoints (see README, Known issues of WanGP).")

@@ -3,7 +3,7 @@
 Use two NVIDIA GPUs in **the same render** in [WanGP](https://github.com/deepbeepmeep/Wan2GP), with a manual work split
 so that GPUs of different speeds (same generation) can be paired, and without giving up WanGP's RAM offloading.
 
-> **Status: v0.5.3, experimental.** The plugin uses the second GPU for:
+> **Status: v0.5.4, experimental.** The plugin uses the second GPU for:
 > - **MiniMax H3**: **denoising** (both GPUs work on the same step, each on part of the tokens), **VAE decoding** and the
 >   **text encoder** (its last layers kept and run on `cuda:1`);
 > - **LTX-2** (2.3 Distilled 1.0 and 1.1, 2.5 Distilled, and their Dev versions; new in v0.5): **denoising** (each GPU on part of the video tokens) and **VAE
@@ -196,7 +196,7 @@ Not split for LTX-2 (Gemma 3 runs once per new prompt and is cached by WanGP).
 ## Requirements
 
 - WanGP v18 or later, with a MiniMax H3 model (FL2VA, Ref2VA, pruned or full; INT8, FP8 or BF16 VAE). LTX-2 support
-  needs WanGP v18.17 or later (tested against v18.17 and v18.21); with an older WanGP the LTX-2 section of the tab says it
+  needs WanGP v18.17 or later (tested against v18.17, v18.21 and v18.81); with an older WanGP the LTX-2 section of the tab says it
   is unavailable and the H3 features work as before.
 - Two NVIDIA GPUs of the same generation (tested: RTX 5080 + RTX 5070 Ti, and two RTX 5080, Blackwell).
 - Windows or Linux. No NCCL, no `torch.distributed`, no peer-to-peer GPU access needed: everything runs in WanGP's process.
@@ -328,6 +328,8 @@ LTX-2 hooks (installed after the H3 ones):
     for the duration of the decode so that the tiles of `cuda:1` are fed from its recorded output.
 12. At the first split pass, `LTX2.generate` is wrapped so that the block copies kept between steps are dropped when a
     generation ends.
+13. At startup, Triton's `JITFunction._do_compile` and `triton.compiler.compile` take a process-wide lock, and so does
+    `shared.kernels.triton_tuner.LaunchTuner.config` (WanGP v18.81+): one compilation and one launch tuning at a time.
 
 When the plugin is disabled, every hook calls the original WanGP code directly.
 
@@ -395,9 +397,27 @@ used, and the `[Multi-GPU]` and `[H3 Profiler]` console lines for the same rende
   without multi-GPU. WanGP's `int8_backend.linear_multi` (one input shared by several projections) reads that attribute
   without a default, which only ConvRot INT8 layers have. The plugin installs a guard at startup, whatever its switches:
   in that case only, each projection runs on its own, the path WanGP takes for projections it cannot share (same
-  result). Without the plugin, choose another INT8 backend (Comfy Kitchen or Triton) for such checkpoints.
+  result). Without the plugin, choose another INT8 backend (Comfy Kitchen or Triton) for such checkpoints. Fixed in
+  WanGP v18.81: the guard is then not installed.
+- **Two GPUs compiling the same Triton kernel at once** (multi-GPU only; seen with WanGP v18.81, whose Sage attention
+  computes key means with new Triton kernels, `token_mean`, compiled the first time the H3 VAE runs on both GPUs):
+  `PermissionError: [Errno 13] Permission denied: ...\.triton\cache\...\_finish_kernel.json`. Triton writes a
+  compiled kernel to its file cache under a temporary name, renames it and reads it back; on Windows, a thread cannot
+  open a file that another thread is replacing. Any INT8 backend can hit it (it is not a WGPKernels issue): it only
+  needs a Triton kernel that is not in the cache yet. The plugin makes Triton compilations of the process run one at a
+  time (the second GPU then finds the kernel in the cache), and WanGP's Triton launch tuner tune one kernel at a time
+  (both threads also wrote its cache file, `~/.triton/autotune`). Installed at startup; a lock taken once per new kernel.
 
 ## Changelog
+
+- **0.5.4** (WanGP v18.81, WGPKernels 1.4.2):
+  - fix for the `PermissionError ... .triton\cache\..._finish_kernel.json` of a first H3 VAE decode on two GPUs: Triton
+    compilations and WanGP's Triton launch tuning are serialized (see Known issues of WanGP);
+  - H3 VAE split: if the secondary GPU fails, its tiles are decoded on the primary GPU (the video is still complete);
+    a decode stopped by an error is reported as such (it was reported as "on one GPU, nothing to split");
+  - the WanGP v18.21 INT8 guard is only installed on WanGP versions that need it (v18.81 has the fix, and the guard would
+    have kept its shared projections from running for plain quanto INT8 layers);
+  - tests run against WanGP v18.81 (H3, ControlNet, LTX-2.3 and 2.5, VAE, UI); new `tests/test_kernel_compat.py`.
 
 - **0.5.3**: LTX-2.3 Distilled 1.1 and LTX-2.5 Distilled (INT8 ConvRot checkpoint, keyframe embedding, feed-forward
   without bias) checked and documented; new LTX-2.5 cases in the tests. No change was needed in the split itself.

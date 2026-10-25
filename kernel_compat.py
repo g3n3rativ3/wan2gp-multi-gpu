@@ -25,6 +25,17 @@ mode, CUDA refuses allocations and other "unsafe" calls from every other thread,
 fails ("CUDA error: the operation cannot be performed in the present state"). The fix: these tuning sessions run one
 at a time, and their captures use the "thread_local" mode, which only restricts the capturing thread. Nothing else
 changes: other CUDA graphs keep their own mode, and the tuning results are the same.
+
+Triton compilation (WanGP v18.81+)
+----------------------------------
+Triton keeps the kernels it compiles in a file cache (``~/.triton/cache``): it writes each kernel's files to a
+temporary name, then renames them, and reads them back right after. When the two GPUs compile the same kernel at the
+same moment (each GPU's thread meets it for the first time in the same pass, such as WanGP's ``token_mean`` kernels of
+Sage attention in the H3 VAE), Windows refuses to open a file another thread is replacing: "PermissionError: [Errno 13]
+Permission denied: ...\\.triton\\cache\\...\\_finish_kernel.json". The fix: Triton compilations of this process run one at a
+time (the second thread then finds the kernel in the cache), and the launch tuner of WanGP's Triton kernels
+(``shared.kernels.triton_tuner.LaunchTuner``, whose cache file both threads would also write) tunes one kernel at a
+time. Compilation happens once per kernel and shape, so nothing changes once the kernels are compiled.
 """
 import functools
 import ctypes
@@ -215,6 +226,52 @@ def _prepare_triton():
     return None
 
 
+_compile_lock = threading.RLock()
+
+
+def _locked(function, lock):
+    @functools.wraps(function)
+    def locked(*args, **kwargs):
+        with lock:
+            return function(*args, **kwargs)
+    locked._wangp_mgpu = True
+    locked._wangp_mgpu_original = function
+    return locked
+
+
+def install_triton_locks():
+    """One Triton compilation at a time in this process, and one tuning of WanGP's launch tuner at a time (see the
+    module docstring). Installed at startup, whatever the plugin's switches: a lock taken once per new kernel costs
+    nothing, and the secondary GPU's threads may compile kernels as soon as a split starts. Returns what was installed."""
+    installed = []
+    try:
+        import triton.compiler as triton_compiler
+        from triton.compiler import compiler as triton_compiler_module
+        from triton.runtime import jit as triton_jit
+    except Exception:
+        return installed
+    do_compile = getattr(triton_jit.JITFunction, "_do_compile", None)
+    if do_compile is not None and not getattr(do_compile, "_wangp_mgpu", False):
+        triton_jit.JITFunction._do_compile = _locked(do_compile, _compile_lock)
+        installed.append("Triton compilation")
+    for module in (triton_compiler_module, triton_compiler):   # kernels compiled outside JITFunction._do_compile
+        function = getattr(module, "compile", None)
+        if callable(function) and not getattr(function, "_wangp_mgpu", False):
+            module.compile = _locked(function, _compile_lock)
+            if "Triton compilation" not in installed:
+                installed.append("Triton compilation")
+    try:
+        from shared.kernels import triton_tuner
+        tuner = getattr(triton_tuner, "LaunchTuner", None)
+        config = getattr(tuner, "config", None)
+        if config is not None and not getattr(config, "_wangp_mgpu", False):
+            tuner.config = _locked(config, _tuning_lock)
+            installed.append("WanGP Triton launch tuning")
+    except Exception:
+        pass
+    return installed
+
+
 def prepare_secondary(primary_index, secondary_index):
     """Make WanGP's INT8 kernels usable on ``secondary_index`` while ``primary_index`` works. Returns None when ready (or
     nothing to do), else the reason why INT8 layers cannot run on that GPU. Call it from the main thread, before any
@@ -241,6 +298,12 @@ def install_wangp_fixes():
     original = getattr(int8_backend, "linear_multi", None)
     if original is None or getattr(original, "_wangp_mgpu", False):
         return False
+    try:   # fixed in WanGP (v18.81 reads the attribute with getattr): nothing to do
+        import inspect
+        if "modules[0]._convrot_group_size" not in inspect.getsource(original):
+            return False
+    except (OSError, TypeError):
+        pass
 
     @functools.wraps(original)
     def linear_multi(modules, x):

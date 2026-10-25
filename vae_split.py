@@ -124,8 +124,24 @@ def _patched_forward(self, hidden_states, tokens=False):
     remote_input = _to_pinned_host(hidden_states[keep:])
     replica._interrupt = getattr(self, "_interrupt", False)
     future = _executor(secondary_index).submit(_run_secondary, replica, remote_input, tokens, secondary_index)
-    local = orig(self, hidden_states[:keep], tokens) if keep > 0 else None
-    remote = future.result().to(primary, non_blocking=True)
+    try:
+        local = orig(self, hidden_states[:keep], tokens) if keep > 0 else None
+    except BaseException:
+        try:   # nothing left running on the secondary GPU when the decode stops here
+            future.result()
+        except BaseException:
+            pass
+        raise
+    try:
+        remote = future.result().to(primary, non_blocking=True)
+    except Exception as exc:   # the secondary GPU failed: its tiles are decoded here, the video is still complete
+        _warn_once(f"remote_{type(exc).__name__}", f"The secondary GPU could not decode its VAE tiles ({type(exc).__name__}: "
+                                                   f"{exc}): they are decoded on cuda:{primary_index}.")
+        traceback.print_exc()
+        remote = orig(self, hidden_states[keep:], tokens)
+        if _state["decode"] is not None:
+            _state["decode"]["failed"] = f"{type(exc).__name__}: {exc}"
+        keep = batch
     out = remote if local is None else torch.cat((local, remote), dim=0)
 
     stats = _state["decode"]
@@ -160,18 +176,29 @@ def _wrap_decode(orig_decode):
             return orig_decode(self, *args, **kwargs)
         _state["decode"] = {"calls": 0, "tiles": 0, "local": 0, "split_time": 0.0}
         started = time.perf_counter()
+        failed = None
         try:
             return orig_decode(self, *args, **kwargs)
+        except BaseException as exc:
+            failed = f"{type(exc).__name__}: {exc}"
+            raise
         finally:
-            torch.cuda.synchronize()
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
             stats, _state["decode"] = _state["decode"], None
             total = time.perf_counter() - started
-            if stats and stats["calls"]:
+            if failed is not None:
+                report = f"Last H3 VAE decode stopped after {total:.1f} s by an error ({failed[:200]})."
+            elif stats and stats["calls"]:
                 primary = torch.cuda.current_device()
                 secondary = other_gpu(primary)
                 report = (f"Last H3 VAE decode: {total:.1f} s, {stats['calls']} clip(s) of {stats['tiles']} tiles: "
                           f"{stats['local']} on cuda:{primary} ({gpu_name(primary)}), "
-                          f"{stats['tiles'] - stats['local']} on cuda:{secondary} ({gpu_name(secondary)}).")
+                          f"{stats['tiles'] - stats['local']} on cuda:{secondary} ({gpu_name(secondary)})"
+                          + (f"; the secondary GPU failed ({stats['failed'][:200]}), its tiles were decoded on "
+                             f"cuda:{primary}." if stats.get("failed") else "."))
             else:
                 report = f"Last H3 VAE decode: {total:.1f} s on one GPU (nothing to split: tiling off, a single tile, or share at 100/0)."
             _state["last_report"] = report
